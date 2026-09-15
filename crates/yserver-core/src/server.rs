@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::Write,
-    os::unix::net::UnixStream,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU16, Ordering},
@@ -17,6 +16,7 @@ use yserver_protocol::x11::{
 use crate::{
     randr::{RandrOutput, RandrOutputProperty, RandrState},
     resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW, ResourceTable},
+    transport::Transport,
 };
 
 pub const FIRST_CLIENT_BASE: u32 = 0x0010_0000;
@@ -2240,7 +2240,11 @@ impl ShapeWindowState {
 
 #[derive(Debug)]
 pub struct ClientState {
-    pub writer: Arc<Mutex<UnixStream>>,
+    pub writer: Arc<Mutex<Transport>>,
+    /// Transport-locality policy, matching Xorg's `ClientRec::local`.
+    pub is_local: bool,
+    /// Whether this connection can carry SCM_RIGHTS descriptors.
+    pub fd_passing: bool,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
     pub resource_id_base: u32,
@@ -2323,7 +2327,7 @@ pub enum ReaderControl {
 /// Snapshot of a client's writer for cross-client event fanout.
 #[derive(Clone)]
 pub struct EventTarget {
-    pub writer: Arc<Mutex<UnixStream>>,
+    pub writer: Arc<Mutex<Transport>>,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
 }
@@ -3514,6 +3518,7 @@ pub fn next_dpms_level(current: u8, idle_ms: u32, dpms: &DpmsState) -> u8 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn float_atom_is_pre_interned_at_server_init() {
@@ -3693,6 +3698,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.clients.insert(
@@ -3713,6 +3720,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         // PropertyChange = 0x0040_0000
@@ -3741,6 +3750,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
@@ -3766,6 +3777,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             };
 
             assert_eq!(
@@ -3805,6 +3818,8 @@ mod tests {
             watching_writable: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: None,
+            is_local: true,
+            fd_passing: true,
         };
 
         // Button bits come from device 0; motion bit from either. First-match
@@ -3840,6 +3855,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             };
 
             assert_eq!(
@@ -3870,6 +3887,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -3898,6 +3917,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.clients.insert(
@@ -3918,6 +3939,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -3961,6 +3984,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -3968,9 +3993,9 @@ mod tests {
         assert!(state.client_target(ClientId(8)).is_none());
     }
 
-    fn make_test_writer() -> Arc<Mutex<UnixStream>> {
+    fn make_test_writer() -> Arc<Mutex<Transport>> {
         let (a, _b) = UnixStream::pair().expect("socketpair");
-        Arc::new(Mutex::new(a))
+        Arc::new(Mutex::new(Transport::Unix(a)))
     }
 
     #[test]
@@ -3986,7 +4011,7 @@ mod tests {
         state.clients.insert(
             1,
             ClientState {
-                writer: Arc::new(Mutex::new(a_writer_local)),
+                writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0x0010_0000,
@@ -4001,12 +4026,14 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.clients.insert(
             2,
             ClientState {
-                writer: Arc::new(Mutex::new(b_writer_local)),
+                writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0x0020_0000,
@@ -4021,6 +4048,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -4078,6 +4107,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -4159,7 +4190,7 @@ mod tests {
             s.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(grab_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,
@@ -4174,12 +4205,14 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
                 2,
                 ClientState {
-                    writer: Arc::new(Mutex::new(target_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(target_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0020_0000,
@@ -4194,6 +4227,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.set_pointer_grab(ActivePointerGrab {
@@ -4318,7 +4353,7 @@ mod tests {
             s.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(grab_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,
@@ -4333,12 +4368,14 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
                 2,
                 ClientState {
-                    writer: Arc::new(Mutex::new(child_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(child_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0020_0000,
@@ -4353,6 +4390,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.set_pointer_grab(ActivePointerGrab {
@@ -4478,7 +4517,7 @@ mod tests {
             s.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(grab_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,
@@ -4493,12 +4532,14 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
                 2,
                 ClientState {
-                    writer: Arc::new(Mutex::new(child_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(child_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0020_0000,
@@ -4513,6 +4554,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.set_pointer_grab(ActivePointerGrab {
@@ -4597,7 +4640,7 @@ mod tests {
             s.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(a_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,
@@ -4612,12 +4655,14 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
                 2,
                 ClientState {
-                    writer: Arc::new(Mutex::new(b_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0020_0000,
@@ -4632,12 +4677,14 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
                 3,
                 ClientState {
-                    writer: Arc::new(Mutex::new(c_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(c_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0030_0000,
@@ -4652,6 +4699,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
         }
@@ -4736,7 +4785,7 @@ mod tests {
             s.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(a_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,
@@ -4751,12 +4800,14 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
                 2,
                 ClientState {
-                    writer: Arc::new(Mutex::new(b_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0020_0000,
@@ -4771,6 +4822,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
         }
@@ -4855,7 +4908,7 @@ mod tests {
             s.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(a_writer_local)),
+                    writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,
@@ -4870,6 +4923,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
         }
@@ -4992,6 +5047,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
     }
@@ -5447,6 +5504,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         let (win, px, py, _subs) = state

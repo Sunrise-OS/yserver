@@ -17148,6 +17148,23 @@ impl Backend for KmsBackend {
         Some(ARGB_COLORMAP.0)
     }
 
+    fn fb_dimensions(&self) -> (u16, u16) {
+        KmsBackend::fb_dimensions(self)
+    }
+
+    fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (
+        Vec<yserver_core::randr::RandrOutput>,
+        Vec<yserver_core::randr::RandrMode>,
+    ) {
+        KmsBackend::randr_outputs_and_modes(self)
+    }
+
+    fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
+        KmsBackend::randr_providers(self)
+    }
+
     fn render_opcode(&self) -> Option<u8> {
         Some(133)
     }
@@ -29382,7 +29399,7 @@ mod tests {
         state.clients.insert(
             7,
             ClientState {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(9)),
                 resource_id_base: 0,
@@ -29397,6 +29414,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: yserver_core::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.randr_select_masks.insert(
@@ -39826,7 +39845,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,
@@ -39841,6 +39860,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
     }
