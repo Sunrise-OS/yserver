@@ -3863,10 +3863,8 @@ impl KmsBackend {
     /// Redirected windows are skipped, as on the resize path: their
     /// pixels live in a core-owned backing whose extent is chosen in
     /// `bordered_backing_extent` and rotated by
-    /// `rotate_redirected_backing_on_resize`, which fires on a size
-    /// change only. Growing a redirect backing for a border-width
-    /// change is that function's business, not this one's; recorded as
-    /// a gap rather than half-done here.
+    /// `rotate_redirected_backing_on_resize`, which also handles a
+    /// border-width change after this backend configure returns.
     fn relayout_window_leaf_storage_for_border_change(&mut self, host_xid: u32) {
         let Some(old_id) = self.store.lookup(host_xid) else {
             return;

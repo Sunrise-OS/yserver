@@ -10305,6 +10305,146 @@ fn border_content_clip_confines_copy_area_destination() {
     brd_assert_ring(&mut b, xid, BRD_RED, Some(BRD_GREEN), "copy_area dst");
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn redirected_titlebar_copy_preserves_border() {
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    const W: u32 = 0x1470;
+    const SRC: u32 = 0x1471;
+    const GC: u32 = 0x1472;
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        32,
+        20,
+        30,
+        BRD_CW,
+        BRD_CH,
+        BRD_BW,
+        yserver_core::resources::ARGB_VISUAL.0,
+        8 | 0x2000,
+        &[BRD_RED, yserver_core::resources::ARGB_COLORMAP.0],
+    );
+    wz_map(&mut f, W);
+    let mut body = root.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    f.req(144, 2, &body);
+    let mut body = SRC.to_le_bytes().to_vec();
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&BRD_CW.to_le_bytes());
+    body.extend_from_slice(&BRD_CH.to_le_bytes());
+    f.req(53, 32, &body);
+    or_create_gc(&mut f, GC, SRC, BRD_GREEN);
+    or_fill(&mut f, SRC, GC, 0, 0, BRD_CW, BRD_CH);
+    let mut body = SRC.to_le_bytes().to_vec();
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&[0; 8]);
+    body.extend_from_slice(&BRD_CW.to_le_bytes());
+    body.extend_from_slice(&3u16.to_le_bytes());
+    f.req(62, 0, &body);
+    let host = f
+        .state
+        .resources
+        .window(yserver_protocol::x11::ResourceId(W))
+        .unwrap()
+        .host_xid
+        .unwrap()
+        .as_raw();
+    brd_assert_ring(&mut f.backend, host, BRD_RED, None, "titlebar copy");
+    let (sw, _, pixels) = f.backing(W);
+    let offset = ((u32::from(BRD_BW) * sw + u32::from(BRD_BW)) * 4) as usize;
+    assert_eq!(&pixels[offset..offset + 4], &brd_bgra(BRD_GREEN));
+
+    // Reading the window also starts at its content origin, not its ring.
+    let mut body = W.to_le_bytes().to_vec();
+    body.extend_from_slice(&SRC.to_le_bytes());
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&[0; 8]);
+    body.extend_from_slice(&BRD_CW.to_le_bytes());
+    body.extend_from_slice(&3u16.to_le_bytes());
+    f.req(62, 0, &body);
+    let src = f
+        .state
+        .resources
+        .pixmap(yserver_protocol::x11::ResourceId(SRC))
+        .unwrap()
+        .host_xid
+        .unwrap()
+        .as_raw();
+    let copied = f
+        .backend
+        .get_image_pixels_for_tests(src, 2, 0, 0, BRD_CW, 3, !0)
+        .unwrap()
+        .unwrap();
+    for pixel in copied.chunks_exact(4) {
+        assert_eq!(pixel, &brd_bgra(BRD_GREEN));
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn redirected_menu_border_change_resizes_backing() {
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    const W: u32 = 0x1460;
+    const GC: u32 = 0x1461;
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        32,
+        20,
+        30,
+        100,
+        30,
+        0,
+        yserver_core::resources::ARGB_VISUAL.0,
+        8 | 0x2000,
+        &[BRD_RED, yserver_core::resources::ARGB_COLORMAP.0],
+    );
+    wz_map(&mut f, W);
+    let mut body = root.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    f.req(144, 2, &body);
+    or_create_gc(&mut f, GC, W, BRD_GREEN);
+    or_fill(&mut f, W, GC, 0, 0, 100, 30);
+    for (mask, values, extent, content) in [
+        (0x10, vec![2], (104, 34), (2..102, 2..32)),
+        // Same outer extent, different content origin.
+        (0x1c, vec![98, 28, 3], (104, 34), (3..101, 3..31)),
+        (0x10, vec![1], (100, 30), (1..99, 1..29)),
+        (0x10, vec![0], (98, 28), (0..98, 0..28)),
+    ] {
+        let mut body = GC.to_le_bytes().to_vec();
+        body.extend_from_slice(&3u32.to_le_bytes()); // function | plane-mask
+        body.extend_from_slice(&5u32.to_le_bytes()); // GXnoop
+        body.extend_from_slice(&0u32.to_le_bytes());
+        f.req(56, 0, &body);
+        or_fill(&mut f, W, GC, 0, 0, 1, 1);
+        wz_configure(&mut f, W, mask, &values);
+        let (sw, sh, pixels) = f.backing(W);
+        assert_eq!((sw, sh), extent, "named backing includes the new border");
+        for y in 0..sh {
+            for x in 0..sw {
+                let expected = if content.0.contains(&x) && content.1.contains(&y) {
+                    BRD_GREEN
+                } else {
+                    BRD_RED
+                };
+                let offset = ((y * sw + x) * 4) as usize;
+                assert_eq!(
+                    &pixels[offset..offset + 4],
+                    &brd_bgra(expected),
+                    "config {values:?}: pixel ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
 /// `CopyArea` SOURCE: a copy OUT of a bordered window may not carry
 /// ring pixels with it. The ring is painted a colour that appears
 /// nowhere else, through the privileged route, so its presence in the

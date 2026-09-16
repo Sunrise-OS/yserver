@@ -33,6 +33,27 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-16 #143 follow-up, awesome borders on bee:** the drawable dump
+  exposed two separate failures. The frame backing already contained title-bar
+  pixels in its top/left border: core `CopyArea` substituted the redirect
+  pixmap before dispatch, bypassing KMS's window content offset and clip.
+  `CopyArea` now preserves window identity for both source and destination;
+  named pixmaps still address the whole backing, including the border.
+
+  The menu's content backing was correct at 100x30, but awesome added a 2-pixel
+  border after mapping and the backing stayed 100x30 instead of 104x34.
+  Configure now rotates redirected storage on border-width changes as well
+  as resizes, copying content from the old inset to the new one. This also
+  handles a combined resize/border change whose outer extent is unchanged.
+  The internal preservation copy resets the last client's drawing state;
+  a preceding GXnoop/zero-plane-mask draw otherwise lost edge pixels.
+
+  Both failures reproduced through protocol requests against the real KMS
+  backend before the fixes. All 163 Vulkan render acceptance tests and 1357
+  core unit tests pass, including pixel checks for border growth, shrink,
+  removal, unchanged outer extent, and CopyArea in both directions.
+  Live awesome/picom visual confirmation is still pending.
+
 - **2026-09-16 #143 "already open windows get broken rendering" is the RESIZE,
   not the redirect:** the reporter's symptom, and jos's HW A/B on nothing but
   launch order (awesome + picom: terminals spawned before picom lost their

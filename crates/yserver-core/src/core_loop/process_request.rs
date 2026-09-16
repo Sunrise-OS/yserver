@@ -1251,6 +1251,7 @@ fn rotate_redirected_backing_on_resize(
     new_width: u16,
     new_height: u16,
     force_reallocate: bool,
+    old_border_width: u16,
 ) {
     let snapshot = state.resources.window(window).and_then(|w| {
         w.redirected_backing.as_ref().map(|b| {
@@ -1277,6 +1278,7 @@ fn rotate_redirected_backing_on_resize(
     let (new_width, new_height) = bordered_backing_extent(new_width, new_height, border_width);
 
     if !force_reallocate
+        && old_border_width == border_width
         && backend.redirected_backing_can_fit(old_backing, new_width, new_height, depth)
     {
         if let Some(w) = state.resources.window_mut(window)
@@ -1457,27 +1459,38 @@ fn rotate_redirected_backing_on_resize(
     // same end state from the other side: `compCopyWindow` copies first
     // and `compSetPixmap` queues `compRepaintBorder` afterwards
     // (../xserver/composite/compwindow.c:137-139), so the ring is always
-    // the freshly painted one. Both backings put content at `(bw, bw)`
-    // (`allocate_redirected_backing` → `set_content_offset`), and the
-    // backing xids resolve in raw storage space, so the inset applies to
-    // source and destination alike. Identity at `bw == 0`.
-    let inset = border_width.saturating_mul(2);
-    let copy_w = old_width.min(new_width).saturating_sub(inset);
-    let copy_h = old_height.min(new_height).saturating_sub(inset);
+    // the freshly painted one. Each backing uses its allocation-time
+    // border inset; a border-width change moves the content between them.
+    let old_inset = old_border_width.saturating_mul(2);
+    let new_inset = border_width.saturating_mul(2);
+    let copy_w = old_width
+        .saturating_sub(old_inset)
+        .min(new_width.saturating_sub(new_inset));
+    let copy_h = old_height
+        .saturating_sub(old_inset)
+        .min(new_height.saturating_sub(new_inset));
+    let old_content_origin = i16::try_from(old_border_width).unwrap_or(i16::MAX);
     let content_origin = i16::try_from(border_width).unwrap_or(i16::MAX);
+    // Storage preservation has no client GC, just like Present's copy.
+    let copy_gc = crate::backend::DrawState::default();
     if copy_w > 0
         && copy_h > 0
-        && let Err(err) = backend.copy_area(
-            origin,
-            old_backing.as_raw(),
-            new_backing.as_raw(),
-            content_origin,
-            content_origin,
-            content_origin,
-            content_origin,
-            copy_w,
-            copy_h,
-        )
+        && let Err(err) = backend
+            .apply_clip_state(origin, &copy_gc.clip)
+            .and_then(|()| backend.apply_draw_state(origin, &copy_gc))
+            .and_then(|()| {
+                backend.copy_area(
+                    origin,
+                    old_backing.as_raw(),
+                    new_backing.as_raw(),
+                    old_content_origin,
+                    old_content_origin,
+                    content_origin,
+                    content_origin,
+                    copy_w,
+                    copy_h,
+                )
+            })
     {
         log::warn!(
             "rotate_redirected_backing_on_resize(0x{:x}): \
@@ -21611,7 +21624,8 @@ fn handle_configure_window(
         }
         let resized =
             old_size.is_some_and(|(ow, oh)| geometry.width != ow || geometry.height != oh);
-        if resized {
+        let old_border_width = before_geom.map_or(geometry.border_width, |g| g.4);
+        if resized || old_border_width != geometry.border_width {
             rotate_redirected_backing_on_resize(
                 state,
                 backend,
@@ -21620,6 +21634,7 @@ fn handle_configure_window(
                 geometry.width,
                 geometry.height,
                 false,
+                old_border_width,
             );
         }
         // NOTE (Issue 2 — 2026-07-01): a pure move MUST NOT rotate the
@@ -26779,6 +26794,19 @@ fn handle_copy_area(
     let src = state.resources.host_drawable_target(request.src);
     let dst = state.resources.host_drawable_target(request.dst);
     if let (Some(src), Some(dst)) = (src.as_ref(), dst.as_ref()) {
+        // Keep window identity so the backend applies its content offset
+        // and clip before resolving a redirect backing. Named pixmaps still
+        // address the entire backing, including its border.
+        let src_host = state
+            .resources
+            .window(request.src)
+            .and_then(|w| w.host_xid)
+            .map_or_else(|| src.host_xid(), |h| h.as_raw());
+        let dst_host = state
+            .resources
+            .window(request.dst)
+            .and_then(|w| w.host_xid)
+            .map_or_else(|| dst.host_xid(), |h| h.as_raw());
         if src.depth() != dst.depth() {
             return emit_x11_error(
                 state,
@@ -26827,12 +26855,8 @@ fn handle_copy_area(
         // `subwindow-mode=ClipByChildren` default by subtracting every
         // mapped child window's geometry from the destination rect.
         //
-        // We do this at the dispatch layer because
-        // `state.resources.host_drawable_target(req.dst)` eagerly
-        // substitutes a redirected window's backing pixmap for its
-        // host_xid, so the backend can no longer tell the original
-        // destination was a window. Splitting here keeps the existing
-        // backend trait shape and applies to v1 and v2 uniformly.
+        // Split in window-local coordinates before the backend translates
+        // each piece to backing space.
         // ClipState::Pixmap (mask-pixmap clip) is out of scope for this
         // fix and passes through untouched.
         let copy_sub_rects = if request.width == 0 || request.height == 0 {
@@ -26856,14 +26880,7 @@ fn handle_copy_area(
                 .src_y
                 .saturating_add(sub.y.saturating_sub(request.dst_y));
             backend.copy_area(
-                origin,
-                src.host_xid(),
-                dst.host_xid(),
-                sub_src_x,
-                sub_src_y,
-                sub.x,
-                sub.y,
-                sub.width,
+                origin, src_host, dst_host, sub_src_x, sub_src_y, sub.x, sub.y, sub.width,
                 sub.height,
             )?;
         }
@@ -26882,7 +26899,7 @@ fn handle_copy_area(
         // — independent of the graphics-exposures setting.
         if !missing.is_empty() && state.resources.window(request.dst).is_some() {
             for (mx, my, mw, mh) in &missing {
-                backend.paint_window_background_rect(origin, dst.host_xid(), *mx, *my, *mw, *mh)?;
+                backend.paint_window_background_rect(origin, dst_host, *mx, *my, *mw, *mh)?;
                 let _dropped = accumulate_damage_to_state(state, request.dst, *mx, *my, *mw, *mh);
             }
         }
@@ -50162,6 +50179,7 @@ mod tests {
             100,
             75,
             false,
+            0,
         );
 
         let calls = backend.calls();
@@ -50276,6 +50294,7 @@ mod tests {
             NEW_W,
             NEW_H,
             false,
+            0,
         );
 
         // NEW handle is whatever the RecordingBackend's allocate
@@ -50361,6 +50380,7 @@ mod tests {
             NEW_CONTENT_W,
             NEW_CONTENT_H,
             false,
+            BW,
         );
 
         let new_backing = state
@@ -50443,6 +50463,7 @@ mod tests {
             NEW_CONTENT_W,
             NEW_CONTENT_H,
             false,
+            BW,
         );
 
         let new_backing = state
@@ -50603,6 +50624,7 @@ mod tests {
             NEW_W,
             NEW_H,
             true,
+            0,
         );
 
         let calls = backend.calls();
@@ -50709,6 +50731,7 @@ mod tests {
             W,
             H,
             true,
+            0,
         );
 
         let calls = backend.calls();
@@ -57321,6 +57344,7 @@ mod tests {
             100,
             75,
             false,
+            0,
         );
 
         let calls = backend.calls();
@@ -60537,12 +60561,10 @@ mod tests {
                 "copy strip ({dx},{dy} {w}x{h}) overlaps the child rect (11,41 975x600); \
                  ClipByChildren must exclude mapped children",
             );
-            // All strips must target the frame's backing pixmap (the
-            // host xid eagerly substituted by host_drawable_target).
+            // Preserve window identity for backend border translation.
             assert_eq!(
-                *dst_host, FRAME_BACKING_HOST,
-                "ClipByChildren splitting must NOT change the backend's \
-                 dst host_xid; it stays the redirected backing pixmap",
+                *dst_host, FRAME_HOST,
+                "ClipByChildren strips stay in window-local coordinates",
             );
         }
     }
