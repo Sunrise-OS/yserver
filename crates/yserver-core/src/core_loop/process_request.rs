@@ -68,6 +68,13 @@ const XI2_MAJOR_OPCODE: u8 = 137;
 /// `XI_BadDevice = 0`, so the wire `BadDevice` code is `XI2_FIRST_ERROR + 0`.
 const XI2_FIRST_ERROR: u8 = 157;
 const XFIXES_MAJOR_OPCODE: u8 = 140;
+/// Core request major opcodes for the three resource-release requests
+/// that must report an unresolvable XID. Values match this file's own
+/// dispatch arms and `yserver_protocol::x11::request_lengths`
+/// (`54 => FreePixmap`, `60 => FreeGC`, `95 => FreeCursor`).
+const FREE_PIXMAP_OPCODE: u8 = 54;
+const FREE_GC_OPCODE: u8 = 60;
+const FREE_CURSOR_OPCODE: u8 = 95;
 const XI2_SERVER_MAJOR_VERSION: u16 = 2;
 const XI2_SERVER_MINOR_VERSION: u16 = 4;
 /// Highest request numbers in the corresponding Xorg dispatch tables.
@@ -27253,16 +27260,47 @@ fn handle_set_clip_rectangles(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcFreeGC` (`../xserver/dix/dispatch.c:1677`) resolves the id
+/// with `dixLookupGC` -> `dixLookupResourceByType(X11_RESTYPE_GC)`, which
+/// on a miss returns that resource type's `errorValue` — `BadGC`
+/// (`../xserver/dix/resource.c:454`) — after setting `client->errorValue`
+/// to the id exactly as sent. Silently succeeding is the same defect
+/// class as #143 on FreePixmap: for a *checked void* request the error
+/// packet is the only thing that can carry a higher sequence number back
+/// to XCB, so swallowing it leaves every preceding checked request of
+/// that client uncompleted.
 fn handle_free_gc(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(gc) = x11::free_resource_id(body) {
-        state.resources.free_gc(gc);
+    let Some(gc) = x11::free_resource_id(body) else {
+        debug!(
+            "client {} #{} FreeGC (parse failed)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    };
+    if state.resources.gc(gc).is_none() {
+        debug!(
+            "client {} #{} FreeGC gc=0x{:x} unknown -> BadGC",
+            client_id.0, sequence.0, gc.0
+        );
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_GC,
+            gc.0,
+            FREE_GC_OPCODE,
+        );
     }
-    debug!("client {} #{} FreeGC", client_id.0, sequence.0);
+    state.resources.free_gc(gc);
+    debug!(
+        "client {} #{} FreeGC gc=0x{:x} freed",
+        client_id.0, sequence.0, gc.0
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -27291,6 +27329,11 @@ fn handle_change_save_set(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcFreeCursor` (`../xserver/dix/dispatch.c:3100`) looks the id
+/// up with `dixLookupResourceByType(X11_RESTYPE_CURSOR)` and on a miss
+/// sets `client->errorValue = stuff->id` and returns the type's
+/// `errorValue`, `BadCursor` (`../xserver/dix/resource.c:466`). Same
+/// checked-void-request reasoning as `handle_free_gc` above.
 fn handle_free_cursor(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -27299,12 +27342,35 @@ fn handle_free_cursor(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(cursor) = x11::free_resource_id(body)
-        && let Some(host_xid) = state.resources.free_cursor(cursor)
-    {
+    let Some(cursor) = x11::free_resource_id(body) else {
+        debug!(
+            "client {} #{} FreeCursor (parse failed)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    };
+    if !state.resources.cursor_exists(cursor) {
+        debug!(
+            "client {} #{} FreeCursor cursor=0x{:x} unknown -> BadCursor",
+            client_id.0, sequence.0, cursor.0
+        );
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_CURSOR,
+            cursor.0,
+            FREE_CURSOR_OPCODE,
+        );
+    }
+    let host_xid = state.resources.free_cursor(cursor);
+    if let Some(host_xid) = host_xid {
         let _ = backend.free_cursor(origin, host_xid);
     }
-    debug!("client {} #{} FreeCursor", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} FreeCursor cursor=0x{:x} freed host_xid={host_xid:?}",
+        client_id.0, sequence.0, cursor.0
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -27399,6 +27465,20 @@ fn handle_create_pixmap(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcFreePixmap` (`../xserver/dix/dispatch.c:1529`) resolves the
+/// id with `dixLookupResourceByType(X11_RESTYPE_PIXMAP)`; on a miss it
+/// sets `client->errorValue = stuff->id` and returns that resource
+/// type's `errorValue`, i.e. `BadPixmap` (`../xserver/dix/resource.c:448`)
+/// — `None` (0) included, since 0 is simply an XID that is not a pixmap.
+///
+/// #143: picom sends a deliberate `FreePixmap(drawable=None)` as a sync
+/// barrier before every sleep (`x_prepare_for_sleep`, picom `src/x.c:1194`)
+/// and *expects* `BadPixmap` back. XCB can only mark a checked **void**
+/// request complete once it reads a packet carrying a higher sequence
+/// number, and for a void request that packet is the error. Returning
+/// silent success left picom's nine checked `ChangeWindowAttributes`
+/// uncompleted, so `wm_handle_set_event_mask_reply` never fired and the
+/// second half of its window import stalled ~10s (Xorg: ~120ms).
 fn handle_free_pixmap(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -27407,27 +27487,50 @@ fn handle_free_pixmap(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(pixmap) = x11::free_resource_id(body) {
-        let removed = state.resources.free_pixmap(pixmap);
-        let still_referenced = removed
-            .as_ref()
-            .and_then(|p| p.host_xid)
-            // The BORDER reference is as load-bearing as the background one:
-            // `XCreatePixmap` → `XSetWindowBorderPixmap` → `XFreePixmap` is
-            // ordinary client code, and X11 keeps the storage alive because
-            // the window still names it (Xorg refcounts
-            // `pWin->border.pixmap`). Omitting it freed the host handle
-            // underneath a ring that was still sampling it (#133). All four
-            // release sites now share one rule.
-            .is_some_and(|xid| state.resources.host_xid_still_referenced(xid));
-        if let Some(removed_pixmap) = removed
-            && let Some(xid) = removed_pixmap.host_xid
-            && !still_referenced
-        {
-            backend.free_pixmap(origin, xid.as_raw())?;
-        }
+    let Some(pixmap) = x11::free_resource_id(body) else {
+        debug!(
+            "client {} #{} FreePixmap (parse failed)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    };
+    let Some(removed) = state.resources.free_pixmap(pixmap) else {
+        debug!(
+            "client {} #{} FreePixmap pixmap=0x{:x} unknown -> BadPixmap",
+            client_id.0, sequence.0, pixmap.0
+        );
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_PIXMAP,
+            pixmap.0,
+            FREE_PIXMAP_OPCODE,
+        );
+    };
+    let still_referenced = removed
+        .host_xid
+        // The BORDER reference is as load-bearing as the background one:
+        // `XCreatePixmap` → `XSetWindowBorderPixmap` → `XFreePixmap` is
+        // ordinary client code, and X11 keeps the storage alive because
+        // the window still names it (Xorg refcounts
+        // `pWin->border.pixmap`). Omitting it freed the host handle
+        // underneath a ring that was still sampling it (#133). All four
+        // release sites now share one rule.
+        .is_some_and(|xid| state.resources.host_xid_still_referenced(xid));
+    if let Some(xid) = removed.host_xid
+        && !still_referenced
+    {
+        backend.free_pixmap(origin, xid.as_raw())?;
     }
-    debug!("client {} #{} FreePixmap", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} FreePixmap pixmap=0x{:x} freed host_xid={:?} retained={}",
+        client_id.0,
+        sequence.0,
+        pixmap.0,
+        removed.host_xid.map(crate::backend::PixmapHandle::as_raw),
+        still_referenced
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -35536,6 +35639,248 @@ mod tests {
         let buf = &bytes[..32];
         assert_eq!(buf[1], x11::error::BAD_GC);
         assert_eq!(buf[10], 70);
+    }
+
+    /// Decode a 32-byte X11 error at the wire offsets fixed by the core
+    /// protocol encoding (`Errors`): 0 = 0, 1 = code, 2..4 = sequence,
+    /// 4..8 = bad resource id / value, 8..10 = minor opcode, 10 = major
+    /// opcode. Asserted as raw bytes on purpose — running the reply back
+    /// through our own decoder would pass even if encoder and decoder
+    /// were wrong together.
+    fn assert_x11_error_bytes(
+        bytes: &[u8],
+        code: u8,
+        bad_value: u32,
+        minor: u16,
+        major: u8,
+        sequence: u16,
+        what: &str,
+    ) {
+        assert_eq!(
+            bytes.len(),
+            32,
+            "{what}: expected exactly one 32-byte error, got {:02x?}",
+            bytes
+        );
+        assert_eq!(bytes[0], 0, "{what}: byte 0 marks a packet as an error");
+        assert_eq!(bytes[1], code, "{what}: error code");
+        assert_eq!(
+            u16::from_le_bytes([bytes[2], bytes[3]]),
+            sequence,
+            "{what}: sequence number"
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            bad_value,
+            "{what}: bad resource id must be the XID exactly as sent"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            minor,
+            "{what}: minor opcode"
+        );
+        assert_eq!(bytes[10], major, "{what}: major opcode");
+    }
+
+    /// Drive one four-byte resource-release request (FreePixmap / FreeGC /
+    /// FreeCursor: `xResourceReq`, 2 units total) through the real
+    /// dispatch table and return whatever the client was sent.
+    fn run_free_resource_request(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        opcode: u8,
+        xid: u32,
+        sequence: u16,
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
+        let body = xid.to_le_bytes().to_vec();
+        process_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        read_all_available(peer)
+    }
+
+    /// #143. picom's `x_prepare_for_sleep` (picom `src/x.c:1194`) fires a
+    /// deliberately invalid `FreePixmap(drawable=None)` as a sync barrier
+    /// and *expects* `BadPixmap`: XCB only completes a checked **void**
+    /// request once it reads a packet with a higher sequence number, and
+    /// for a void request that packet is the error. Xorg answers every one
+    /// of these (measured: 419 requests -> 419 `BadPixmap`); we answered
+    /// none of 538, so picom's checked `ChangeWindowAttributes` batch never
+    /// completed and its window import stalled ~10s instead of ~120ms.
+    #[test]
+    fn free_pixmap_none_returns_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 54, 0, 0x0067);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_PIXMAP,
+            0,
+            0,
+            54,
+            0x0067,
+            "FreePixmap(None)",
+        );
+    }
+
+    #[test]
+    fn free_pixmap_unknown_xid_returns_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 54, 0x00de_ad00, 7);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_PIXMAP,
+            0x00de_ad00,
+            0,
+            54,
+            7,
+            "FreePixmap(unknown)",
+        );
+    }
+
+    /// The error path must not swallow the ordinary one: a pixmap the
+    /// server knows is freed silently, as Xorg's `Success` return does.
+    #[test]
+    fn free_pixmap_known_xid_reports_no_error() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(0x3100),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+            },
+        );
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 54, 0x3100, 8);
+
+        assert!(
+            bytes.is_empty(),
+            "FreePixmap(known) must be silent, got {bytes:02x?}"
+        );
+        assert!(state.resources.pixmap(ResourceId(0x3100)).is_none());
+    }
+
+    /// Xorg `ProcFreeGC` -> `dixLookupGC` -> `X11_RESTYPE_GC.errorValue`
+    /// = `BadGC` (`../xserver/dix/resource.c:454`).
+    #[test]
+    fn free_gc_none_returns_bad_gc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 60, 0, 0x0068);
+
+        assert_x11_error_bytes(&bytes, x11::error::BAD_GC, 0, 0, 60, 0x0068, "FreeGC(None)");
+    }
+
+    #[test]
+    fn free_gc_unknown_xid_returns_bad_gc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 60, 0x00be_ef00, 9);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_GC,
+            0x00be_ef00,
+            0,
+            60,
+            9,
+            "FreeGC(unknown)",
+        );
+    }
+
+    #[test]
+    fn free_gc_known_xid_reports_no_error() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .resources
+            .seed_gc_for_test(ClientId(1), ResourceId(0x2100));
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 60, 0x2100, 10);
+
+        assert!(
+            bytes.is_empty(),
+            "FreeGC(known) must be silent, got {bytes:02x?}"
+        );
+        assert!(state.resources.gc(ResourceId(0x2100)).is_none());
+    }
+
+    /// Xorg `ProcFreeCursor` -> `X11_RESTYPE_CURSOR.errorValue` =
+    /// `BadCursor` (`../xserver/dix/resource.c:466`).
+    #[test]
+    fn free_cursor_none_returns_bad_cursor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 95, 0, 0x0069);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_CURSOR,
+            0,
+            0,
+            95,
+            0x0069,
+            "FreeCursor(None)",
+        );
+    }
+
+    #[test]
+    fn free_cursor_unknown_xid_returns_bad_cursor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 95, 0x00c0_ff00, 11);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_CURSOR,
+            0x00c0_ff00,
+            0,
+            95,
+            11,
+            "FreeCursor(unknown)",
+        );
+    }
+
+    #[test]
+    fn free_cursor_known_xid_reports_no_error() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(0x4100));
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 95, 0x4100, 12);
+
+        assert!(
+            bytes.is_empty(),
+            "FreeCursor(known) must be silent, got {bytes:02x?}"
+        );
+        assert!(!state.resources.cursor_exists(ResourceId(0x4100)));
     }
 
     #[test]
