@@ -37,8 +37,9 @@ use crate::{
     core_loop::{
         client_io::{self, WriteOutcome},
         damage_fanout::{
-            accumulate_damage_clip_by_children_to_state, accumulate_damage_full_to_state,
-            accumulate_damage_to_state, report_existing_damage_to_state,
+            accumulate_damage_border_to_state, accumulate_damage_clip_by_children_to_state,
+            accumulate_damage_full_to_state, accumulate_damage_to_state,
+            report_existing_damage_to_state,
         },
         fanout::{
             client_target_id, emit_expose_subtree_to_state,
@@ -1014,6 +1015,18 @@ fn activate_redirect_backing_for(
                 .is_some_and(|w| w.map_state == MapState::Viewable)
             {
                 let _dropped = accumulate_damage_full_to_state(state, window);
+                // #143 — and the RING, which `accumulate_damage_full_to_state`
+                // cannot express: its rect is `(0, 0, width, height)`, i.e.
+                // `winSize`, which excludes the border by construction. The
+                // backing we just allocated is the BORDERED extent and
+                // `allocate_redirected_backing` paints the ring into it, so
+                // the compositor has to be told about those pixels too.
+                // Xorg gets this for free — `compSetPixmapVisitWindow` queues
+                // `compRepaintBorder` whenever `bw != 0`
+                // (`composite/compwindow.c:137-139`), and that repaint is an
+                // ordinary GC op the DAMAGE wrapper sees. Identity at
+                // `bw == 0`.
+                let _dropped = accumulate_damage_border_to_state(state, window);
             }
         }
         Err(err) => {
@@ -21176,6 +21189,28 @@ fn handle_change_window_attributes(
             let _ =
                 backend.change_subwindow_attributes(origin, host_xid.as_raw(), value_mask, &values);
         }
+        // #143 — report protocol DAMAGE for the ring the forward above
+        // just repainted. Xorg does exactly this, in
+        // `ChangeWindowAttributes` itself and on the same condition
+        // (`(vmaskCopy & (CWBorderPixel | CWBorderPixmap)) && pWin->viewable
+        // && HasBorder(pWin)`, `dix/window.c:1581-1589`): it subtracts
+        // `winSize` from `borderClip` and `PaintWindow(..., PW_BORDER)`s the
+        // difference, which lands as a `PolyFillRect` on the window's
+        // (composite backing) pixmap and so goes through `damagePolyFillRect`
+        // (`miext/damage/damage.c:1194`). Xorg does NOT compare old-vs-new
+        // border source, and neither does our backend forward
+        // (`backend.rs:20110` repaints on any `value_mask & 0x0c`), so the
+        // damage has to fire on exactly the same trigger or the reported
+        // region and the painted region drift apart.
+        //
+        // Without this, awesome's focus recolour repainted our backing
+        // correctly but told no compositor: picom, on `EXT_buffer_age`
+        // partial repaint, kept one ring colour per back buffer and
+        // alternated between them at frame rate (#143's border flicker).
+        //
+        // No-op for unbordered windows, for the root and for a
+        // non-viewable window.
+        let _dropped = accumulate_damage_border_to_state(state, target_window);
     }
 
     if let Some(cid) = cursor_id {
@@ -64127,6 +64162,163 @@ mod tests {
             border_forwards(&calls),
             vec![(host_xid, CWA_BORDER_PIXMAP, vec![0x9999_0001])],
         );
+    }
+
+    /// #143 — THE regression gate for the awesome border flicker.
+    ///
+    /// awesome recolours a focused/unfocused frame with a CWA carrying
+    /// only `CWBorderPixel`. We repainted the ring into the redirect
+    /// backing but reported no protocol DAMAGE for it, so picom — which
+    /// partial-repaints from `EXT_buffer_age` — kept one ring colour per
+    /// back buffer and alternated between them at frame rate. Xorg
+    /// reports it from `ChangeWindowAttributes` itself: `borderClip −
+    /// winSize` → `PaintWindow(..., PW_BORDER)` (`dix/window.c:1581-1589`)
+    /// → `PolyFillRect` on the window pixmap (`mi/miexpose.c:448-471`,
+    /// `:558`) → `damagePolyFillRect` (`miext/damage/damage.c:1194`).
+    ///
+    /// Geometry is the captured one: 1276×704 at `border_width = 2`.
+    #[test]
+    fn change_window_attributes_border_pixel_damages_the_ring() {
+        use crate::server::DamageObject;
+        use yserver_protocol::x11::xfixes::RegionRect;
+        const DAMAGE_XID: u32 = 0x0080_9143;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0001);
+        seed_window(&mut state, win, ROOT_WINDOW, 1276, 704);
+        if let Some(w) = state.resources.window_mut(win) {
+            w.border_width = 2;
+        }
+        assert!(state.resources.map_window(win), "window must map");
+        // Raw level: `area` on the wire then carries the real rect
+        // instead of the NonEmpty full-extent substitute, so the test
+        // can prove the negative origin survives the i16 encoding.
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: win,
+                level: 0,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        let body = border_cwa_body(win.0, CWA_BORDER_PIXEL, &[0x0000_ff00]);
+        run_border_request(&mut state, 2, 0, &body);
+
+        let rects = state
+            .damage_objects
+            .get(&DAMAGE_XID)
+            .expect("damage object")
+            .rects
+            .clone();
+        assert_eq!(
+            rects,
+            vec![
+                RegionRect {
+                    x: -2,
+                    y: -2,
+                    width: 1280,
+                    height: 2
+                },
+                RegionRect {
+                    x: -2,
+                    y: 0,
+                    width: 2,
+                    height: 704
+                },
+                RegionRect {
+                    x: 1276,
+                    y: 0,
+                    width: 2,
+                    height: 704
+                },
+                RegionRect {
+                    x: -2,
+                    y: 704,
+                    width: 1280,
+                    height: 2
+                },
+            ],
+            "a border-source change must damage the whole ring, including the \
+             negative-origin top and left strips",
+        );
+
+        // And it must reach the client as real DamageNotify events,
+        // with the negative origin intact on the wire (`area.x` is
+        // INT16 at byte 16).
+        let bytes = read_all_available(&mut peer);
+        let notifies: Vec<&[u8]> = bytes
+            .chunks_exact(32)
+            .filter(|c| c[0] == crate::nested::DAMAGE_FIRST_EVENT)
+            .collect();
+        assert_eq!(
+            notifies.len(),
+            4,
+            "one DamageNotify per ring strip at ReportLevel Raw",
+        );
+        let areas: Vec<(i16, i16, u16, u16)> = notifies
+            .iter()
+            .map(|c| {
+                (
+                    i16::from_le_bytes([c[16], c[17]]),
+                    i16::from_le_bytes([c[18], c[19]]),
+                    u16::from_le_bytes([c[20], c[21]]),
+                    u16::from_le_bytes([c[22], c[23]]),
+                )
+            })
+            .collect();
+        assert!(
+            areas.contains(&(-2, -2, 1280, 2)),
+            "the top strip must arrive at a NEGATIVE origin, got {areas:?}",
+        );
+        assert!(
+            areas.contains(&(-2, 0, 2, 704)),
+            "the left strip must arrive at a NEGATIVE x, got {areas:?}",
+        );
+    }
+
+    /// The ring damage follows Xorg's two gates and no others: nothing
+    /// for an unbordered window (`HasBorder(pWin)`, `dix/window.c:1586`)
+    /// and nothing for a non-viewable one (`pWin->viewable`, same line).
+    #[test]
+    fn change_window_attributes_border_pixel_damages_nothing_unbordered_or_unmapped() {
+        use crate::server::DamageObject;
+        const DAMAGE_XID: u32 = 0x0080_9144;
+        for (bw, map) in [(0u16, true), (2, false)] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let win = ResourceId(0x0080_0001);
+            seed_window(&mut state, win, ROOT_WINDOW, 64, 64);
+            if let Some(w) = state.resources.window_mut(win) {
+                w.border_width = bw;
+            }
+            if map {
+                assert!(state.resources.map_window(win), "window must map");
+            }
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: win,
+                    level: 0,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+
+            let body = border_cwa_body(win.0, CWA_BORDER_PIXEL, &[0x0000_ff00]);
+            run_border_request(&mut state, 2, 0, &body);
+            assert_no_error(&read_all_available(&mut peer), "CWA border-pixel");
+
+            assert!(
+                state.damage_objects[&DAMAGE_XID].rects.is_empty(),
+                "bw={bw} mapped={map}: no ring to report",
+            );
+        }
     }
 
     /// A tile with no host storage degrades to the pixel bit with a
