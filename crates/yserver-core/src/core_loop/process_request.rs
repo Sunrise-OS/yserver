@@ -7172,10 +7172,16 @@ fn handle_composite_request(
                     .keys()
                     .any(|(rwid, sub)| *sub && *rwid == w.parent);
                 let self_redirected = state.composite_redirects.contains_key(&(window, false));
+                let (pixmap_width, pixmap_height) = w
+                    .redirected_backing
+                    .as_ref()
+                    .map_or((w.width, w.height), |backing| {
+                        (backing.width, backing.height)
+                    });
                 (
                     w.host_xid,
-                    w.width,
-                    w.height,
+                    pixmap_width,
+                    pixmap_height,
                     w.depth,
                     parent_redirected || self_redirected,
                     w.map_state,
@@ -49172,6 +49178,78 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn name_window_pixmap_uses_redirected_backing_geometry() {
+        use crate::{
+            backend::{PixmapHandle, WindowHandle},
+            resources::RedirectedBacking,
+            server::{CompositeRedirectMode, RedirectRecord},
+        };
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const WINDOW: ResourceId = ResourceId(0x10004a);
+        const PIXMAP: ResourceId = ResourceId(0x300225);
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new().with_composite_support();
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 32,
+                window: WINDOW,
+                parent: ROOT_WINDOW,
+                width: 646,
+                height: 501,
+                border_width: 2,
+                class: 1,
+                visual: crate::resources::ARGB_VISUAL,
+                ..Default::default()
+            },
+        );
+        assert!(state.resources.map_window(WINDOW));
+        let window = state
+            .resources
+            .window_mut(WINDOW)
+            .expect("window installed");
+        window.host_xid = Some(WindowHandle::from_raw_for_test(0x40008a));
+        window.redirected_backing = Some(RedirectedBacking {
+            host_pixmap: PixmapHandle::from_raw_for_test(0x4000d),
+            width: 650,
+            height: 505,
+            depth: 32,
+        });
+        state.composite_redirects.insert(
+            (WINDOW, false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(1),
+            },
+        );
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&PIXMAP.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::NAME_WINDOW_PIXMAP,
+            &body,
+        );
+
+        let pixmap = state.resources.pixmap(PIXMAP).expect("named pixmap exists");
+        assert_eq!((pixmap.width, pixmap.height), (650, 505));
+        let aliases = &state
+            .resources
+            .window(WINDOW)
+            .expect("window remains installed")
+            .composite_named_pixmaps;
+        assert_eq!(aliases.len(), 1);
+        assert_eq!((aliases[0].width, aliases[0].height), (650, 505));
     }
 
     #[test]

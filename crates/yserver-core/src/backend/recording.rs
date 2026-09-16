@@ -236,6 +236,9 @@ pub struct RecordingBackend {
     /// (gated on the trait method) actually runs. Default `false`
     /// matches the trait default — v1 / host-X11 semantics.
     pub redirect_activation_supported: bool,
+    /// Optional COMPOSITE opcode exposed to request-path tests that need to
+    /// exercise `NameWindowPixmap` through the real dispatcher.
+    composite_opcode: Option<u8>,
     /// KeyButMask returned by `query_pointer` (lets tests model a held
     /// pointer button — e.g. `Button1Mask = 0x0100` — so the
     /// XIQueryPointer reply's button state can be asserted).
@@ -483,6 +486,7 @@ impl RecordingBackend {
             cow_materialize_fails: false,
             cow_teardown_fails: false,
             redirect_activation_supported: false,
+            composite_opcode: None,
             query_pointer_mask: 0,
             dpms_capable: true,
             fb_size: (800, 600),
@@ -612,6 +616,13 @@ impl RecordingBackend {
     #[must_use]
     pub fn with_redirect_activation(mut self) -> Self {
         self.redirect_activation_supported = true;
+        self
+    }
+
+    /// Enable the host COMPOSITE capability for request-path tests.
+    #[must_use]
+    pub fn with_composite_support(mut self) -> Self {
+        self.composite_opcode = Some(144);
         self
     }
 
@@ -991,7 +1002,7 @@ impl Backend for RecordingBackend {
     }
 
     fn composite_opcode(&self) -> Option<u8> {
-        None
+        self.composite_opcode
     }
 
     fn supports_redirect_activation(&self) -> bool {
@@ -1400,7 +1411,7 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         _host_window: WindowHandle,
     ) -> io::Result<PixmapHandle> {
-        unimplemented!("RecordingBackend: name_window_pixmap not implemented for the current tests")
+        Ok(PixmapHandle::from_raw_panicking(self.allocate_handle()))
     }
 
     fn create_pixmap(
