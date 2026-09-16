@@ -16310,6 +16310,18 @@ fn write_drawable_ppm(
 /// - Depth 24 and other non-alpha visuals get opaque black
 ///   `(0, 0, 0, 1)` — matches "uninitialised window shows black"
 ///   which is the historical X11 behaviour clients expect.
+///
+/// The depth-24 arm is not cosmetic. We store depth-24 as
+/// `B8G8R8A8_UNORM`, which has a real alpha byte; Xorg's pixman
+/// representation has none, so a depth-24 image can never hold a
+/// non-opaque alpha there at all — every fetch substitutes `0xff`
+/// (`pixman-access.c:270-276`), and RENDER states the invariant
+/// outright ("the destination alpha is always 1" for
+/// `PICT_FORMAT_A(pDst->format) == 0`, `render/picture.c:1487-1488`).
+/// If our storage starts at `α = 0`, a region the client never paints
+/// reads back as a transparent hole that X11 says cannot exist, and a
+/// depth-32 compositing client blends it. The composite write side of
+/// the same rule is `render_pipeline::dst_color_write_mask`.
 fn default_window_init_color(depth: u8) -> [f32; 4] {
     if depth == 32 {
         [0.0, 0.0, 0.0, 0.0]
@@ -19566,8 +19578,12 @@ impl Backend for KmsBackend {
                     self.telemetry.record_image_view_create();
                     match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
                         Ok(new_cow_id) => {
-                            // Zero-fill so the compositor doesn't see
+                            // Fill so the compositor doesn't see
                             // recycled GPU content on its next paint.
+                            // OPAQUE black, not transparent: the COW is
+                            // a depth-24 drawable, and on X11 depth-24
+                            // has no alpha channel — it is opaque by
+                            // definition. See `default_window_init_color`.
                             let rect = ash::vk::Rect2D {
                                 offset: ash::vk::Offset2D::default(),
                                 extent: ash::vk::Extent2D {
@@ -19580,11 +19596,11 @@ impl Backend for KmsBackend {
                                 &mut self.platform,
                                 Dst::server_internal(new_cow_id),
                                 rect,
-                                [0.0; 4],
+                                default_window_init_color(24),
                             ) && self.platform.vk.is_some()
                             {
                                 log::warn!(
-                                    "render set_logical_screen_size: COW zero-fill failed: {e:?}"
+                                    "render set_logical_screen_size: COW init fill failed: {e:?}"
                                 );
                             }
                             self.cow_id = Some(new_cow_id);
@@ -20627,11 +20643,13 @@ impl Backend for KmsBackend {
     /// Initial fill: storage from `allocate_drawable_storage`
     /// is uninitialised Vk-DEVICE_LOCAL memory (same problem
     /// Stage 3f.14 fixed for `create_pixmap`). We do an explicit
-    /// transparent-black fill via `engine.fill_rect` so the
-    /// compositor's first paint composites over a known zero
-    /// rather than recycled GPU garbage. The fill is best-effort
-    /// — on the stub fixture (no Vk) `engine.fill_rect` errors;
-    /// log + continue (storage already exists at xid level).
+    /// OPAQUE-black fill via `engine.fill_rect` so the
+    /// compositor's first paint composites over a known value
+    /// rather than recycled GPU garbage. Opaque, not transparent:
+    /// the COW is depth-24, and a depth-24 drawable has no alpha
+    /// channel on X11 — see `default_window_init_color`. The fill is
+    /// best-effort — on the stub fixture (no Vk) `engine.fill_rect`
+    /// errors; log + continue (storage already exists at xid level).
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_id.is_some() {
             // Core only calls this on the 0 → 1 claim edge, so a live
@@ -20699,10 +20717,10 @@ impl Backend for KmsBackend {
             &mut self.platform,
             Dst::server_internal(id),
             rect,
-            [0.0; 4],
+            default_window_init_color(24),
         ) && self.platform.vk.is_some()
         {
-            log::warn!("render get_overlay_window: initial zero-fill failed: {e:?}");
+            log::warn!("render get_overlay_window: initial fill failed: {e:?}");
         }
         self.cow_id = Some(id);
 

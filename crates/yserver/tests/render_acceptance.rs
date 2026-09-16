@@ -4552,6 +4552,138 @@ fn render_composite_depth24_src_samples_opaque_alpha() {
     }
 }
 
+/// Destination half of the same rule — sibling to
+/// `render_composite_depth24_src_samples_opaque_alpha` above, which
+/// covers the SOURCE side.
+///
+/// Bug: on X11 a depth-24 drawable has no alpha channel and is opaque
+/// by definition. Xorg gets that for free — pixman's `x8r8g8b8` has
+/// zero alpha bits, so a store drops the channel
+/// (`pixman-access.c:254-261`) and every fetch substitutes `0xff`
+/// (`:270-276`); RENDER states it outright, treating
+/// `PICT_FORMAT_A(pDst->format) == 0` as "the destination alpha is
+/// always 1" (`render/picture.c:1456-1457`, `:1487-1488`). We store
+/// depth-24 as `B8G8R8A8_UNORM`, which has a real alpha byte, and the
+/// composite pipeline wrote it: a `PictOpSrc` from a half-transparent
+/// source left `α = 127` in the backing. A depth-32 compositing
+/// client then blends a hole X11 says cannot exist.
+///
+/// Oracle values are the measured mate-terminal frame backing: body
+/// BGRA `(27, 21, 0)` with `α = 127` where it must be 255, and
+/// regions the client never painted reading `(0, 0, 0, 0)` instead of
+/// opaque black.
+///
+/// Storage-level, not a round trip through our own encoder:
+/// `get_image` on a depth-24 drawable is a verbatim memcpy of the
+/// BGRA8 storage (`pack_from_storage`'s `32 | 24` arm), so `px[3]`
+/// IS the stored alpha byte.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn render_composite_depth24_dst_keeps_opaque_alpha() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Step 1: depth-24 destination, 4×4, straight out of
+    // `create_pixmap` — NO paint of any kind yet.
+    let dst_pix = b.create_pixmap(None, 24, 4, 4).expect("create dst d24");
+    let dst_xid = dst_pix.as_raw();
+
+    let fresh = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image fresh dst")
+        .expect("Some(fresh dst bytes)");
+    assert_eq!(fresh.len(), 4 * 4 * 4, "4×4 BGRA8 readback");
+    for (i, px) in fresh.chunks_exact(4).enumerate() {
+        assert_eq!(
+            px[3], 0xFF,
+            "fresh depth-24 pixmap pixel {i} must be OPAQUE before any paint; got {px:?}. \
+             A depth-24 drawable has no alpha channel — 0x00 here is a hole X11 says \
+             cannot exist.",
+        );
+    }
+
+    // Step 2: depth-32 source carrying the measured mate-terminal
+    // body pixel — X11 wire 0xAARRGGBB = 0x7F_00_15_1B, i.e. BGRA
+    // storage [0x1B, 0x15, 0x00, 0x7F]: RGB (0, 21, 27), α = 127.
+    let src_pix = b.create_pixmap(None, 32, 4, 4).expect("create src d32");
+    let src_xid = src_pix.as_raw();
+    b.fill_rectangle(None, src_xid, 0x7F_00_15_1B, 0, 0, 4, 4)
+        .expect("fill_rectangle src d32 with α=127");
+
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(src_pix), 0, 0, &[])
+        .expect("render_create_picture src")
+        .expect("Some(src PictureHandle)");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(dst PictureHandle)");
+
+    // Step 3: Composite OP_SRC over the TOP-LEFT 2×2 only. `dst = src`
+    // is the simplest predicate for the write side, and the partial
+    // cover leaves the right/bottom of the destination as the
+    // "region the client never painted" case.
+    b.render_composite(
+        None,
+        1, // Src
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        2,
+    )
+    .expect("render_composite");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image dst")
+        .expect("Some(dst bytes)");
+    assert_eq!(out.len(), 4 * 4 * 4, "4×4 BGRA8 readback");
+
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let off = (y * 4 + x) * 4;
+            let px = &out[off..off + 4];
+            let covered = x < 2 && y < 2;
+            assert_eq!(
+                px[3], 0xFF,
+                "dst ({x},{y}) α must be 0xFF; got {px:?}. Covered={covered}. \
+                 Pre-fix the covered pixels read 0x7F (=127, the measured \
+                 mate-terminal failure) because the composite stored the \
+                 source's alpha into a drawable that has no alpha channel.",
+            );
+            if covered {
+                // OP_SRC copies the premultiplied source through.
+                // ±1 for the UNORM8 → float → UNORM8 round trip.
+                for (ch, want) in [(0usize, 27u8), (1, 21), (2, 0)] {
+                    assert!(
+                        px[ch].abs_diff(want) <= 1,
+                        "dst ({x},{y}) channel {ch} want ≈{want}, got {px:?}",
+                    );
+                }
+            } else {
+                assert_eq!(
+                    &px[0..3],
+                    &[0u8, 0, 0],
+                    "dst ({x},{y}) is outside the composite rect and must still be \
+                     the create_pixmap init colour; got {px:?}",
+                );
+            }
+        }
+    }
+}
+
 /// Scene-path α-leak fix — sibling to
 /// `render_composite_depth24_src_samples_opaque_alpha` above,
 /// covering the scene compositor side instead of the engine RENDER
