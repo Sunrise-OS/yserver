@@ -33,6 +33,55 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-16 #143 "already open windows get broken rendering" is the RESIZE,
+  not the redirect:** the reporter's symptom, and jos's HW A/B on nothing but
+  launch order (awesome + picom: terminals spawned before picom lost their
+  content, the same terminals spawned after it kept it), attribute to
+  `configure_subwindow`'s leaf realloc — not to the redirect seed.
+
+  Measured, through `ProtoFixture` on lavapipe, replaying the sequence as
+  protocol requests:
+
+  - the redirect seed is CLEAN. Paint a window, then
+    `RedirectSubwindows(root, Manual)`, and the backing comes up holding the
+    pixels — for a root child, for a reparented client inside a WM frame, at
+    depth 24 and 32, with and without a border. `seed_backing_from_parent` +
+    `overlay_backing_inferiors` reproduce `compNewPixmap`'s
+    `CopyArea(parent, …, IncludeInferiors)`
+    (`composite/compalloc.c:562-571`) faithfully enough for every shape
+    tried. Four separate attempts to make it drop content all came back
+    green.
+  - the unredirected resize WIPES. `sync_window_leaf_storage_to_geometry`
+    reallocated at the new extent and background-filled, discarding what the
+    client had painted. So by the time picom starts, the leaf the seed copies
+    is already blank, and an idle client never repaints it.
+  - and on a SHRINK we emit **no Expose at all** (measured off the client
+    socket: 0 events for 200x100 → 100x100, a full-window Expose for the
+    grow). Xorg exposes "the entire window ... unless bitGravity recovers
+    portions of it" (`mi/miwindow.c:466-472`). So we took the worst of both
+    gravities: we discarded the pixels like `ForgetGravity` and stayed silent
+    like `NorthWestGravity`. Nothing could ever bring the content back.
+
+  Fix: a resize of a window with NO background now migrates its content
+  across the realloc (`LeafContent::Migrate`, the machinery the border-width
+  path already used), which is X11's own rule for the default gravity — "the
+  window is tiled with its background. If no background is defined, the
+  existing screen contents are not altered", which Xorg implements by
+  returning from the paint untouched (`switch (pWin->backgroundState) { case
+  None: return; }`, `mi/miexpose.c:438-440`). A window WITH a background is
+  still discarded and re-tiled: that is the same rule's other half, and it is
+  what the xeyes-resize regression needs. Closes the background-None half of
+  [[project_resize_black_window_storage]].
+
+  **Still open**, both pre-existing and both now pinned by a test that says so
+  when they change: (a) a non-`ForgetGravity` `bit_gravity` should retain the
+  pixels of a window that HAS a background too — the attribute is tracked in
+  `resources.rs` but never reaches the render backend, neither at CreateWindow
+  nor through `change_subwindow_attributes`; (b) the missing shrink Expose,
+  which is the only recovery path left for those windows. Whether the HW
+  xterm that lost its fish banner is fixed depends on which of the two it
+  needs — xterm's background and bit gravity were not measured.
+
 - **2026-09-09 COMPOSITE overlay claim ownership:** the overlay claim is now a
   per-client thing owned by core, as it is in Xorg. `ServerState.cow_claims`
   holds one entry per `GetOverlayWindow` recording the owning `ClientId`, and

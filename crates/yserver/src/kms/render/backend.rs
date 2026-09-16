@@ -213,15 +213,24 @@ fn migrated_content_copy(
 /// The two callers want opposite things and the difference is not an
 /// optimisation:
 ///
-/// - A **width/height** resize has always come back background-filled
-///   on this path (see `project_resize_black_window_storage`: Xorg does
-///   NOT do that, but it is pre-existing behaviour and step 6 keeps it
-///   so the `bw == 0` resize path issues exactly the submits it did
-///   before) — [`Self::Discard`].
 /// - A **border-width** change must preserve the client's drawable:
 ///   nothing about the client's content changed, only where it sits
 ///   inside the storage. Reallocating and background-filling would
 ///   erase an otherwise untouched window — [`Self::Migrate`].
+/// - A **width/height** resize preserves it too, but only for a window
+///   with NO background: X11 discards the contents of a default-gravity
+///   window and tiles it with its background, "if no background is
+///   defined, the existing screen contents are not altered"
+///   (ForgetGravity, ChangeWindowAttributes), which Xorg implements by
+///   returning from the paint without touching a pixel
+///   (`mi/miexpose.c:438-440`). A window WITH a background is tiled, so
+///   it stays on [`Self::Discard`] — see `configure_subwindow` for the
+///   #143 measurement and for why a non-Forget `bit_gravity` cannot be
+///   honoured here yet (`project_resize_black_window_storage`).
+/// - **Unredirect** discards, because the leaf has been stale since the
+///   route was installed and `restore_leaves_from_backing` puts the
+///   compositor's real pixels back on top of the fresh storage —
+///   [`Self::Discard`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeafContent {
     /// Reallocate and initialise from the background; copy nothing
@@ -3638,10 +3647,18 @@ impl KmsBackend {
         rank
     }
 
-    /// Re-sync a window's leaf storage to a **width/height** change.
-    /// Reallocates at the new bordered extent and initialises the whole
-    /// allocation from the background, DISCARDING what was there — see
-    /// [`LeafContent::Discard`] for why step 6 leaves that as it was.
+    /// The UNREDIRECT entry point: re-sync a window's leaf storage to
+    /// its current geometry, reallocating at the bordered extent and
+    /// initialising the whole allocation from the background, DISCARDING
+    /// what was there. That is right HERE and only here: the leaf has
+    /// been stale since the route was installed, and the caller
+    /// immediately puts the compositor's pixels back with
+    /// [`Self::restore_leaves_from_backing`].
+    ///
+    /// The resize path picks its own [`LeafContent`] in
+    /// `configure_subwindow` (#143) and a border-width change migrates
+    /// (see [`Self::relayout_window_leaf_storage_for_border_change`]),
+    /// so both call [`Self::sync_window_leaf_storage`] directly.
     fn sync_window_leaf_storage_to_geometry(&mut self, host_xid: u32) {
         self.sync_window_leaf_storage(host_xid, LeafContent::Discard);
     }
@@ -3926,13 +3943,15 @@ impl KmsBackend {
             //
             // `Discard` never relocates, by design: re-basing the
             // layout without moving the pixels is exactly what step
-            // 3's invariant forbids. Its callers are a pure resize
-            // (where the offset cannot have moved) and unredirect
+            // 3's invariant forbids. Its one caller is unredirect
             // (where the leaf content is being discarded anyway), so
             // the `bw == 0` path returns exactly where it always did.
             // Should unredirect ever find a matching extent with a
             // stale offset, the invariant keeps the window readable at
-            // the offset its pixels actually use.
+            // the offset its pixels actually use. A `Migrate` from the
+            // resize path lands here only when the bordered extent did
+            // not change, and then `old_offset == new_offset` (the
+            // border width is what sets both), so it is a no-op too.
             if content == LeafContent::Migrate && old_offset != new_offset {
                 self.relocate_leaf_content_in_place(
                     host_xid,
@@ -19924,19 +19943,57 @@ impl Backend for KmsBackend {
         // every reader now expects 3.
         //
         // The two paths differ in what happens to the pixels, on
-        // purpose (`LeafContent`): a border-width change preserves the
-        // client's drawable, a pure resize still discards it, which is
-        // what it has always done here (`project_resize_black_window_storage`
-        // — pre-existing, not step 6's).
+        // purpose (`LeafContent`): a border-width change always
+        // preserves the client's drawable, because only the content's
+        // position inside the storage moved; a resize preserves it only
+        // for a window with no background, per the #143 block below.
         if border_width_changed {
             self.relayout_window_leaf_storage_for_border_change(host_xid);
         } else if size_changed
             && let Some(old_id) = self.store.lookup(host_xid)
             && self.store.redirected_target(old_id).is_none()
         {
+            // #143 — a window with NO background keeps its pixels
+            // across the reallocation. X11 says so for the default
+            // gravity in the same breath as the discard: "The window is
+            // tiled with its background. If no background is defined,
+            // the existing screen contents are not altered"
+            // (ForgetGravity, ChangeWindowAttributes), and Xorg
+            // implements exactly that — the resize marks the whole
+            // window exposed (`mi/miwindow.c:466-472`) and the paint
+            // that follows returns without touching a pixel when the
+            // window has none (`switch (pWin->backgroundState) { case
+            // None: return; }`, `mi/miexpose.c:438-440`).
+            //
+            // This is the path an already-open window takes when the WM
+            // retiles it, and discarding here is what made "already open
+            // windows get broken rendering" when a compositor started
+            // (#143): the window was wiped long before the redirect, and
+            // the backing seed (`overlay_backing_inferiors`) then
+            // faithfully copied the blank leaf. A SHRINK cannot recover
+            // — we emit no Expose for one at all (measured:
+            // `a_shrink_keeps_the_content_it_never_exposes`), so nothing
+            // ever asks the client to repaint.
+            //
+            // A window WITH a background is still discarded and re-tiled:
+            // that IS the ForgetGravity rule, and it is what the
+            // xeyes-resize regression (2026-05-16,
+            // `subwindow_resize_clears_old_paint`) needs. Honouring a
+            // non-Forget `bit_gravity` would keep those pixels too, but
+            // the attribute does not reach this backend today.
+            //
             // Reallocates and repaints the ring itself — see
-            // `sync_window_leaf_storage_to_geometry`.
-            self.sync_window_leaf_storage_to_geometry(host_xid);
+            // `sync_window_leaf_storage`.
+            let content = if self
+                .windows
+                .get(&host_xid)
+                .is_some_and(|g| g.bg_pixel.is_none() && g.bg_pixmap.is_none())
+            {
+                LeafContent::Migrate
+            } else {
+                LeafContent::Discard
+            };
+            self.sync_window_leaf_storage(host_xid, content);
         }
         if let Some(stack_mode) = config.stack_mode {
             // Top-level z-order is no longer mutated here: it is a pure
@@ -35550,8 +35607,9 @@ mod tests {
     }
 
     /// #133 step 3 (3.3) — a width/height resize reallocates storage at
-    /// the BORDERED extent. (A `border_width` CHANGE deliberately does
-    /// not migrate content — that is step 6 / P8.)
+    /// the BORDERED extent. It goes through the same `Migrate` door as
+    /// a `border_width` change (#143); this pins the extent, the
+    /// content is pinned by the acceptance suite.
     #[test]
     fn resize_reallocates_storage_at_the_bordered_extent() {
         let mut b = KmsBackend::for_tests();
@@ -35562,12 +35620,12 @@ mod tests {
             g.width = 200;
             g.height = 120;
         }
-        b.sync_window_leaf_storage_to_geometry(0x4060);
+        b.sync_window_leaf_storage(0x4060, super::LeafContent::Migrate);
         assert_eq!(b.storage_extent_for_tests(0x4060), Some((232, 152)));
         // A re-sync with nothing changed must NOT reallocate (the
         // compare-and-skip is against the bordered extent).
         let id_before = b.store.lookup(0x4060);
-        b.sync_window_leaf_storage_to_geometry(0x4060);
+        b.sync_window_leaf_storage(0x4060, super::LeafContent::Migrate);
         assert_eq!(b.store.lookup(0x4060), id_before, "no needless realloc");
     }
 

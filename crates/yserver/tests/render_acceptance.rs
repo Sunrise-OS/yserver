@@ -2787,18 +2787,24 @@ fn adjacent_trapezoids_share_horizontal_boundary_cleanly() {
     }
 }
 
-/// Regression for the xeyes-resize bug (2026-05-16): the user
-/// resizes the xeyes window larger; the new bigger eyes paint
-/// correctly but the OLD small-eye-white pixels at the original
-/// (smaller) positions remain visible in the upper-left of the
-/// window. Indicates the storage isn't being cleared on resize, or
-/// the clear doesn't cover the full new extent.
+/// From the xeyes-resize bug (2026-05-16): the user resizes the
+/// xeyes window larger; the new bigger eyes paint correctly but the
+/// OLD small-eye-white pixels at the original (smaller) positions
+/// remain visible in the upper-left. That is a window WITH a
+/// background, which X11 says to tile on a size change — pinned by
+/// `a_resize_still_retiles_a_window_that_has_a_background`.
 ///
-/// Test: create a 16×16 window, paint a red rect inside it,
-/// configure to 64×64, then get_image the new (bigger) storage at
-/// position (5, 5) — where the old red would still live if the
-/// resize-fill didn't run. Expect the safe-default depth-32 colour
-/// (transparent black), not red.
+/// This window has NO background, so #143 changed what it asserts:
+/// X11 leaves such a window's existing contents alone ("if no
+/// background is defined, the existing screen contents are not
+/// altered"; `mi/miexpose.c:438-440` returns before painting), so the
+/// red the client painted must SURVIVE the grow and only the region
+/// the grow added is initialised.
+///
+/// What it still pins is the storage-orphan regression the fixture was
+/// written for: the old storage's `destroy_now` must not remove
+/// `by_xid[xid]` after the new allocation re-installed it, or the
+/// `get_image` below comes back `None`.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn subwindow_resize_clears_old_paint() {
@@ -2861,9 +2867,8 @@ fn subwindow_resize_clears_old_paint() {
     .expect("configure_subwindow resize");
 
     // Read back the resized storage at (5, 5) — inside the OLD
-    // 16×16 region. Pre-3f.14 / pre-fix: still red (leftover old
-    // paint). 3f.14 expectation: depth-32 safe default
-    // (transparent black, BGRA = [0, 0, 0, 0]).
+    // 16×16 region, which #143 keeps, and at (30, 30), which the
+    // grow added and the storage init covers.
     //
     // get_image waits on its internal fence, which lets the
     // OLD storage's pending_retire entry actually retire via
@@ -2885,17 +2890,19 @@ fn subwindow_resize_clears_old_paint() {
     // (5, 5) is well-inside the old 16×16 footprint.
     assert_eq!(
         pixel(5, 5),
-        [0x00, 0x00, 0x00, 0x00],
-        "post-resize storage at (5,5) must be cleared to safe-default \
-         transparent black (got {:?}); old red would mean the resize-fill \
-         didn't cover this position",
+        [0x00, 0x00, 0xFF, 0xFF],
+        "post-resize storage at (5,5) must still hold the red the client \
+         painted (got {:?}): this window has no background, so nothing is \
+         allowed to alter its existing contents, and nothing will ask it to \
+         repaint them either",
         pixel(5, 5),
     );
     // (30, 30) is outside the old footprint, well inside the new.
     assert_eq!(
         pixel(30, 30),
         [0x00, 0x00, 0x00, 0x00],
-        "post-resize storage at (30,30) must also be cleared (got {:?})",
+        "the region the grow ADDED is initialised, never pool garbage \
+         (got {:?})",
         pixel(30, 30),
     );
 }
@@ -14492,5 +14499,307 @@ fn a_child_at_a_nonzero_offset_in_a_bordered_parent_keeps_its_full_extent() {
         )],
         pplace,
         "parent outer rect",
+    );
+}
+
+// ───── #143 — a resize must not silently destroy a window's content ──
+//
+// Issue #143's reporter: "already open windows get broken rendering"
+// when a compositor starts. Measured on HW (awesome + picom, 2026-09-16)
+// as an A/B on nothing but the launch order: windows spawned BEFORE
+// picom lost their content, the same windows spawned after it kept it.
+//
+// The redirect seed is not what loses it — `overlay_backing_inferiors`
+// copies whatever the window's leaf holds, and these tests show it
+// arriving intact. What loses it is the WM retile that happens while
+// the window is still unredirected: `configure_subwindow` reallocated
+// the leaf and discarded the pixels, and on a SHRINK the client is
+// never told (we emit no Expose there, which is what Xorg does only
+// when bit gravity recovered the bits — `mi/miwindow.c:466-472`), so an
+// idle client never repaints and the window stays broken through the
+// redirect and forever after.
+
+/// A shrink keeps the client's pixels, because nothing else will bring
+/// them back: no Expose is emitted for a shrink, so a discard is
+/// unrecoverable. Both halves are asserted here — the pixels AND the
+/// silence — so the day the Expose side is fixed this test says so.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_shrink_keeps_the_content_it_never_exposes() {
+    use std::io::Read;
+    const W: u32 = 0x1430;
+    const GC: u32 = 0x1431;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    // CWEventMask only: background None, the shape X11 says must be
+    // left alone on a size change (wezterm's, and 37 of KWin's).
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        24,
+        0,
+        0,
+        200,
+        100,
+        0,
+        visual,
+        0x0000_0800,
+        &[0x0000_8000],
+    );
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 200, 100);
+    f._peer
+        .set_nonblocking(true)
+        .expect("nonblocking socketpair");
+    let mut sink = [0u8; 65536];
+    while f._peer.read(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+
+    // The WM retiles when the next window opens.
+    wz_configure(&mut f, W, 0x0C, &[100, 100]);
+
+    let mut buf = [0u8; 65536];
+    let n = f._peer.read(&mut buf).unwrap_or(0);
+    let exposes = (0..n / 32).filter(|k| buf[k * 32] & 0x7f == 12).count();
+    assert_eq!(
+        exposes, 0,
+        "precondition: a shrink emits no Expose, so the pixels below are \
+         all the client will ever have",
+    );
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (100, 100), "storage follows the new geometry");
+    let mut distinct = std::collections::BTreeMap::<[u8; 4], usize>::new();
+    for p in px.chunks_exact(4) {
+        *distinct.entry([p[0], p[1], p[2], p[3]]).or_default() += 1;
+    }
+    assert_eq!(
+        distinct.keys().copied().collect::<Vec<_>>(),
+        vec![[0x00, 0xFF, 0x00, 0xFF]],
+        "every retained pixel must still be the client's green (BGRA); a \
+         background-filled window here is content the client is never \
+         asked to redraw: {distinct:?}",
+    );
+}
+
+/// A grow keeps the pixels it retains. What lands in the strip the grow
+/// added is a separate question (the wezterm ctrl-+ report) and this
+/// test deliberately does not pin it — only that the client's own
+/// content below it survived.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_grow_keeps_the_old_content_of_a_background_none_window() {
+    const W: u32 = 0x1440;
+    const GC: u32 = 0x1441;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(&mut f, W, root, 24, 0, 0, 100, 100, 0, visual, 0, &[]);
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 100, 100);
+    wz_configure(&mut f, W, 0x0C, &[100, 160]);
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (100, 160));
+    let at = |x: usize, y: usize| {
+        let o = (y * sw as usize + x) * 4;
+        [px[o], px[o + 1], px[o + 2], px[o + 3]]
+    };
+    assert_eq!(
+        at(50, 50),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "inside the old footprint the client's own pixels survive a grow",
+    );
+}
+
+/// The other half of the ForgetGravity rule, and the reason #143's fix
+/// is gated on the background: a window that HAS one is discarded and
+/// re-tiled, exactly as X11 specifies and as the xeyes-resize
+/// regression needs.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_resize_still_retiles_a_window_that_has_a_background() {
+    const W: u32 = 0x1448;
+    const GC: u32 = 0x1449;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    // CWBackPixel = blue.
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        24,
+        0,
+        0,
+        100,
+        100,
+        0,
+        visual,
+        0x0000_0002,
+        &[0x0000_00FF],
+    );
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 100, 100);
+    wz_configure(&mut f, W, 0x0C, &[60, 60]);
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (60, 60));
+    let mut distinct = std::collections::BTreeMap::<[u8; 4], usize>::new();
+    for p in px.chunks_exact(4) {
+        *distinct.entry([p[0], p[1], p[2], p[3]]).or_default() += 1;
+    }
+    assert_eq!(
+        distinct.keys().copied().collect::<Vec<_>>(),
+        vec![[0xFF, 0x00, 0x00, 0xFF]],
+        "a window with a background comes back tiled with it, not holding \
+         the client's old pixels: {distinct:?}",
+    );
+}
+
+/// The reporter's scenario end to end, through the protocol: a window
+/// paints, the WM retiles it, and only THEN does a compositor call
+/// `CompositeRedirectSubwindows(root, Manual)`. The redirect backing has
+/// to come up holding what was on screen — which is what Xorg's
+/// `compNewPixmap` guarantees by copying the parent with
+/// `IncludeInferiors` (`composite/compalloc.c:562-571`), and what our
+/// `seed_backing_from_parent` + `overlay_backing_inferiors` pair
+/// reproduces. It can only carry what the leaf still holds, so this is
+/// the test that fails if the retile wipes it.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn an_already_open_window_keeps_its_content_when_a_compositor_starts() {
+    const FRAME: u32 = 0x1450;
+    const CLIENT: u32 = 0x1451;
+    const GC: u32 = 0x1452;
+    for retile_first in [false, true] {
+        let Some(mut f) = ProtoFixture::new() else {
+            eprintln!("skipping: no Vk");
+            return;
+        };
+        let root = yserver_core::resources::ROOT_WINDOW.0;
+        let visual = yserver_core::resources::ROOT_VISUAL.0;
+        // A reparenting WM's frame under root, with the client inside:
+        // `RedirectSubwindows(root)` redirects the FRAME, and the
+        // client's pixels have to reach the frame's backing from a
+        // level down.
+        or_create_window(&mut f, FRAME, root, 24, 10, 20, 200, 100, 2, visual, 0, &[]);
+        or_create_window(&mut f, CLIENT, FRAME, 24, 0, 0, 200, 100, 0, visual, 0, &[]);
+        wz_map(&mut f, CLIENT);
+        wz_map(&mut f, FRAME);
+        or_create_gc(&mut f, GC, CLIENT, 0x0000_FF00);
+        or_fill(&mut f, CLIENT, GC, 0, 0, 200, 100);
+
+        let retile = |f: &mut ProtoFixture| {
+            wz_configure(f, FRAME, 0x0C, &[100, 100]);
+            wz_configure(f, CLIENT, 0x0C, &[100, 100]);
+        };
+        let start_compositor = |f: &mut ProtoFixture| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&root.to_le_bytes());
+            body.extend_from_slice(&[1u8, 0, 0, 0]); // CompositeRedirectManual
+            f.req(144, 2, &body);
+        };
+        if retile_first {
+            retile(&mut f);
+            start_compositor(&mut f);
+        } else {
+            start_compositor(&mut f);
+            retile(&mut f);
+        }
+
+        // The compositor reads the frame's backing. Content sits `bw`
+        // inside it (`compSetPixmap(pWin, pPixmap, bw)`,
+        // `composite/compalloc.c:620`), so sample well inside.
+        let (sw, sh, px) = f.backing(FRAME);
+        assert_eq!((sw, sh), (104, 104), "bordered backing extent");
+        let at = |x: usize, y: usize| {
+            let o = (y * sw as usize + x) * 4;
+            [px[o], px[o + 1], px[o + 2], px[o + 3]]
+        };
+        for (x, y) in [(10usize, 10usize), (50, 50), (90, 90)] {
+            assert_eq!(
+                at(x, y),
+                [0x00, 0xFF, 0x00, 0xFF],
+                "retile_first={retile_first}: the compositor must be handed \
+                 the pixels the client painted, at ({x},{y})",
+            );
+        }
+    }
+}
+
+/// The migrated content must land at the border inset, never at the
+/// storage origin: a bordered window's storage starts at its OUTER
+/// origin with the content `bw` inside (`compAllocPixmap`,
+/// `composite/compalloc.c:610`), so a copy that forgot the inset would
+/// both shift the image and eat the ring. Guards the #143 resize path
+/// specifically — the ring is the only thing that can tell the two
+/// apart once the content is uniform.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_shrink_keeps_the_content_at_the_border_inset() {
+    const W: u32 = 0x1460;
+    const GC: u32 = 0x1461;
+    const BW: usize = 3;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    // CWBorderPixel (0x08) = red; background stays None.
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        24,
+        0,
+        0,
+        100,
+        100,
+        BW as u16,
+        visual,
+        0x0000_0008,
+        &[0x00FF_0000],
+    );
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 100, 100);
+    wz_configure(&mut f, W, 0x0C, &[60, 60]);
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (66, 66), "bordered storage extent");
+    let at = |x: usize, y: usize| {
+        let o = (y * sw as usize + x) * 4;
+        [px[o], px[o + 1], px[o + 2], px[o + 3]]
+    };
+    assert_eq!(
+        at(0, 0),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "the ring keeps the border pixel; content at (0,0) would mean the \
+         migrate copy dropped the inset",
+    );
+    assert_eq!(
+        at(BW, BW),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "the content starts at (bw, bw)",
+    );
+    assert_eq!(
+        at(sw as usize - BW - 1, sh as usize - BW - 1),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "and runs to the far content corner",
     );
 }
