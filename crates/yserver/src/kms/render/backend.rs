@@ -20500,9 +20500,23 @@ impl Backend for KmsBackend {
         let Some(drawable) = self.store.get(id) else {
             return false;
         };
+        // #143: EXACT, not a high-water mark. `width`/`height` are the
+        // bordered extent the backing must have (`bordered_backing_extent`,
+        // `process_request.rs`), and Xorg reallocates on inequality in
+        // EITHER direction — `compReallocPixmap` compares
+        // `pix_w != pOld->drawable.width || pix_h != pOld->drawable.height`
+        // (../xserver/composite/compalloc.c:698) with
+        // `pix_w = w + (bw << 1)`.
+        //
+        // A `>=` here made a SHRINK keep the oversized storage while the
+        // caller rewrote only the logical geometry: the ring then sat at
+        // the OLD content width (measured under awesome+picom, backing
+        // 1282x708 with the 2-px ring at columns 1280..1281 for a window
+        // that had shrunk to 1276 wide) and nothing re-seeded the backing,
+        // leaving an alpha-0 band where content should be.
         drawable.depth == depth
-            && drawable.storage.extent.width >= u32::from(width)
-            && drawable.storage.extent.height >= u32::from(height)
+            && drawable.storage.extent.width == u32::from(width)
+            && drawable.storage.extent.height == u32::from(height)
     }
 
     fn update_redirected_backing_geometry(
@@ -37323,8 +37337,26 @@ mod tests {
         assert_eq!(extent_after.height, 140);
     }
 
+    /// #143 (rendering half) — the reuse test is an EQUALITY on the
+    /// backing's STORAGE extent.
+    ///
+    /// Until 2026-09-16 this test asserted `can_fit(180, 140) == true`
+    /// against 200x150 storage: it PINNED the high-water-mark reuse that
+    /// turned out to be the bug. A shrink kept the oversized backing,
+    /// `update_redirected_backing_geometry` moved the logical alias
+    /// geometry, and nothing re-laid the border ring or re-seeded the
+    /// storage — measured under awesome+picom as a backing left at
+    /// 1282x708 (ring at columns 1280..1281) for a window that had
+    /// shrunk to 1276 content-pixels wide, with an alpha-0 band where
+    /// content should be. Xorg reallocates on inequality in EITHER
+    /// direction: `compReallocPixmap` compares `pix_w !=
+    /// pOld->drawable.width || pix_h != pOld->drawable.height`
+    /// (../xserver/composite/compalloc.c:698).
+    ///
+    /// The extents below are those measured numbers; `width`/`height`
+    /// are bordered extents (`bw = 2`).
     #[test]
-    fn redirected_backing_reuse_tracks_logical_geometry_separately_from_storage() {
+    fn redirected_backing_reuse_requires_the_exact_storage_extent() {
         use crate::kms::{
             core::AliasEntry,
             render::store::{DrawableKind, Storage},
@@ -37333,7 +37365,7 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let backing = PixmapHandle::from_raw_panicking(0x9000_0001);
-        let _id = b
+        let id = b
             .store
             .allocate(
                 backing.as_raw(),
@@ -37342,8 +37374,8 @@ mod tests {
                 false,
                 Storage::for_tests_null(
                     ash::vk::Extent2D {
-                        width: 200,
-                        height: 150,
+                        width: 1282,
+                        height: 708,
                     },
                     ash::vk::Format::B8G8R8A8_UNORM,
                 ),
@@ -37353,23 +37385,50 @@ mod tests {
             backing,
             AliasEntry {
                 refcount: 1,
-                width: 100,
-                height: 100,
+                width: 1282,
+                height: 708,
                 depth: 32,
             },
         );
+        let storage_extent =
+            |b: &KmsBackend| b.store.get(id).expect("backing drawable").storage.extent;
+        assert_eq!(storage_extent(&b).width, 1282);
+        assert_eq!(storage_extent(&b).height, 708);
 
-        assert!(b.redirected_backing_can_fit(backing, 180, 140, 32));
-        assert!(!b.redirected_backing_can_fit(backing, 220, 140, 32));
+        // The shrink that regressed: the storage is big ENOUGH, but it is
+        // not the right size, so it must NOT be reused.
+        assert!(
+            !b.redirected_backing_can_fit(backing, 1280, 708, 32),
+            "a shrink must reallocate — an oversized backing still has its \
+             ring and its parent seed laid out for the OLD extent",
+        );
+        // The grow direction rotated before #143 too; keep it that way.
+        assert!(!b.redirected_backing_can_fit(backing, 1284, 708, 32));
+        assert!(!b.redirected_backing_can_fit(backing, 1282, 712, 32));
+        // Exact match: reuse, no reallocation.
+        assert!(b.redirected_backing_can_fit(backing, 1282, 708, 32));
+        // Depth is still part of the test.
+        assert!(!b.redirected_backing_can_fit(backing, 1282, 708, 24));
 
-        b.update_redirected_backing_geometry(None, backing, 180, 140, 32)
+        // What a TRUE verdict authorises is a metadata-only update — and
+        // it provably does NOT touch storage. That asymmetry is why a
+        // test reading only the alias geometry would have passed against
+        // the buggy predicate, and why the assertions above read the
+        // store's extent instead.
+        b.update_redirected_backing_geometry(None, backing, 1280, 708, 32)
             .expect("update logical geometry");
         let alias = b
             .test_alias_registry_get(backing.as_raw())
             .expect("alias entry");
-        assert_eq!(alias.width, 180);
-        assert_eq!(alias.height, 140);
+        assert_eq!(alias.width, 1280);
+        assert_eq!(alias.height, 708);
         assert_eq!(alias.depth, 32);
+        assert_eq!(
+            storage_extent(&b).width,
+            1282,
+            "the metadata path moves the logical geometry and leaves the \
+             storage at its allocated extent",
+        );
     }
 
     // ────────────────────────────────────────────────────────────────

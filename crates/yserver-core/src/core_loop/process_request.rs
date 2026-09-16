@@ -1434,18 +1434,34 @@ fn rotate_redirected_backing_on_resize(
     // hits 0). NameWindowPixmap aliases keep it alive through this
     // path; the v2 backend's lifecycle for the no-alias case is
     // tightened separately.
-    let copy_w = old_width.min(new_width);
-    let copy_h = old_height.min(new_height);
+    //
+    // #143: the copy carries CONTENT only. Since #133 the ring lives
+    // INSIDE the storage at `(0,0)..(bw,bw)` and the allocate above has
+    // already painted NEW's ring at the NEW extent; copying the full
+    // `min(old, new)` box from OLD's origin would paint over it — and on
+    // a SHRINK that box is the whole new backing, so NEW's right/bottom
+    // ring columns would get OLD's *interior* pixels. Xorg reaches the
+    // same end state from the other side: `compCopyWindow` copies first
+    // and `compSetPixmap` queues `compRepaintBorder` afterwards
+    // (../xserver/composite/compwindow.c:137-139), so the ring is always
+    // the freshly painted one. Both backings put content at `(bw, bw)`
+    // (`allocate_redirected_backing` → `set_content_offset`), and the
+    // backing xids resolve in raw storage space, so the inset applies to
+    // source and destination alike. Identity at `bw == 0`.
+    let inset = border_width.saturating_mul(2);
+    let copy_w = old_width.min(new_width).saturating_sub(inset);
+    let copy_h = old_height.min(new_height).saturating_sub(inset);
+    let content_origin = i16::try_from(border_width).unwrap_or(i16::MAX);
     if copy_w > 0
         && copy_h > 0
         && let Err(err) = backend.copy_area(
             origin,
             old_backing.as_raw(),
             new_backing.as_raw(),
-            0,
-            0,
-            0,
-            0,
+            content_origin,
+            content_origin,
+            content_origin,
+            content_origin,
             copy_w,
             copy_h,
         )
@@ -50265,6 +50281,223 @@ mod tests {
              missing the compCopyWindow analog that carries pre-resize \
              contents into the freshly-allocated backing. Calls: {calls:?}",
         );
+    }
+
+    // #143 (rendering half) — a SHRINK must rotate exactly like a grow.
+    //
+    // Measured under awesome+picom: switching tiling layout shrank a
+    // mate-terminal frame (`bw = 2`) from 1278x704 to 1276x704 and the
+    // render module logged NOTHING — `redirected_backing_can_fit` was a
+    // high-water-mark test, so the 1282x708 backing was kept and only its
+    // metadata was rewritten. The backing's ring stayed laid out for the
+    // OLD 1278-px content (2-px ring at columns 1280..1281) and nothing
+    // re-seeded it, leaving an alpha-0 band where content should be.
+    //
+    // Xorg reallocates on inequality in EITHER direction:
+    // `compReallocPixmap` (../xserver/composite/compalloc.c:698), whose
+    // replacement is always freshly seeded from the parent
+    // (`compNewPixmap`, compalloc.c:539-605).
+    //
+    // The backend predicate is where the fix lives (its own unit test is
+    // `redirected_backing_reuse_requires_the_exact_storage_extent`);
+    // what this test pins is the core half — that the realloc path
+    // allocates at the NEW bordered extent and carries only the CONTENT
+    // overlap, leaving the freshly painted ring of NEW alone.
+    #[test]
+    fn rotate_redirected_backing_on_shrink_allocates_the_new_bordered_extent() {
+        use crate::backend::recording::RecordedCall;
+
+        const BW: u16 = 2;
+        // Content 1278x704 → backing 1282x708 (the pre-switch state).
+        const OLD_BACKING_W: u16 = 1282;
+        const OLD_BACKING_H: u16 = 708;
+        // Shrink to content 1276x704 → backing 1280x708.
+        const NEW_CONTENT_W: u16 = 1276;
+        const NEW_CONTENT_H: u16 = 704;
+
+        let (mut state, mut backend, old_backing) =
+            redirected_window_fixture(OLD_BACKING_W, OLD_BACKING_H, BW);
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(ROTATE_WINDOW_XID),
+            NEW_CONTENT_W,
+            NEW_CONTENT_H,
+            false,
+        );
+
+        let new_backing = state
+            .resources
+            .window(ResourceId(ROTATE_WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .expect("redirected_backing repointed after the shrink rotate");
+        assert_ne!(
+            new_backing.host_pixmap.as_raw(),
+            old_backing,
+            "a shrink must rotate onto a FRESH backing, not keep the oversized one",
+        );
+        assert_eq!(
+            (new_backing.width, new_backing.height),
+            (1280, 708),
+            "the new backing is the new BORDERED extent (1276 + 2*2, 704 + 2*2)",
+        );
+
+        let calls = backend.calls();
+        assert!(
+            calls.contains(&RecordedCall::AllocateRedirectedBacking {
+                host_window: ROTATE_HOST_XID,
+                width: 1280,
+                height: 708,
+                depth: 32,
+            }),
+            "the shrink must allocate storage at the new bordered extent \
+             1280x708, not keep 1282x708. Calls: {calls:?}",
+        );
+
+        // Content-only copy: both backings hold content at `(bw, bw)`,
+        // and the overlap is min(1278, 1276) x min(704, 704).
+        let new_raw = new_backing.host_pixmap.as_raw();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x: 2,
+                    src_y: 2,
+                    dst_x: 2,
+                    dst_y: 2,
+                    width: 1276,
+                    height: 704,
+                } if *src_host_xid == old_backing && *dst_host_xid == new_raw
+            )),
+            "the rotate copy must carry the CONTENT overlap inset by the \
+             border width — a full-extent copy would repaint NEW's \
+             right/bottom ring columns with OLD's interior pixels. \
+             Calls: {calls:?}",
+        );
+    }
+
+    // The over-correction guard for the test above: a bordered GROW must
+    // keep rotating the way it always did, and its copy is inset the same
+    // way (the ring of NEW is painted by `allocate_redirected_backing`;
+    // Xorg repaints it too, via the `compRepaintBorder` work proc queued
+    // from `compSetPixmap`, ../xserver/composite/compwindow.c:137-139).
+    #[test]
+    fn rotate_redirected_backing_on_bordered_grow_still_rotates_and_copies_content() {
+        use crate::backend::recording::RecordedCall;
+
+        const BW: u16 = 2;
+        // Content 1276x704 → backing 1280x708, growing to content
+        // 1278x704 → backing 1282x708.
+        const OLD_BACKING_W: u16 = 1280;
+        const OLD_BACKING_H: u16 = 708;
+        const NEW_CONTENT_W: u16 = 1278;
+        const NEW_CONTENT_H: u16 = 704;
+
+        let (mut state, mut backend, old_backing) =
+            redirected_window_fixture(OLD_BACKING_W, OLD_BACKING_H, BW);
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(ROTATE_WINDOW_XID),
+            NEW_CONTENT_W,
+            NEW_CONTENT_H,
+            false,
+        );
+
+        let new_backing = state
+            .resources
+            .window(ResourceId(ROTATE_WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .expect("redirected_backing repointed after the grow rotate");
+        assert_eq!((new_backing.width, new_backing.height), (1282, 708));
+
+        let calls = backend.calls();
+        assert!(
+            calls.contains(&RecordedCall::AllocateRedirectedBacking {
+                host_window: ROTATE_HOST_XID,
+                width: 1282,
+                height: 708,
+                depth: 32,
+            }),
+            "the grow must allocate at the new bordered extent. Calls: {calls:?}",
+        );
+        let new_raw = new_backing.host_pixmap.as_raw();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x: 2,
+                    src_y: 2,
+                    dst_x: 2,
+                    dst_y: 2,
+                    width: 1276,
+                    height: 704,
+                } if *src_host_xid == old_backing && *dst_host_xid == new_raw
+            )),
+            "the grow copy carries the same content overlap, inset by the \
+             border width. Calls: {calls:?}",
+        );
+    }
+
+    const ROTATE_WINDOW_XID: u32 = 0x0010_0001;
+    const ROTATE_HOST_XID: u32 = 0x0040_0001;
+
+    /// A root child already redirected, with a backing whose recorded
+    /// extent is `(backing_w, backing_h)` — i.e. the post-activation
+    /// state, before the resize under test. Returns the OLD backing's
+    /// raw xid alongside the fixture.
+    fn redirected_window_fixture(
+        backing_w: u16,
+        backing_h: u16,
+        border_width: u16,
+    ) -> (ServerState, RecordingBackend, u32) {
+        const OLD_BACKING: u32 = 0x0050_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(ROTATE_WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: backing_w.saturating_sub(border_width.saturating_mul(2)),
+                height: backing_h.saturating_sub(border_width.saturating_mul(2)),
+                border_width,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(ROTATE_WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                ROTATE_HOST_XID,
+            ));
+            w.border_width = border_width;
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: backing_w,
+                height: backing_h,
+                depth: 32,
+            });
+        }
+        (state, backend, OLD_BACKING)
     }
 
     // Storage-alive invariant for the rotate copy. Observed in HW
