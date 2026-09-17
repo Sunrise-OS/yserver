@@ -353,6 +353,43 @@ fn scanout_direct_eligible(
     // source crop proven valid.
 }
 
+/// Which retained direct frame a single CRTC is scanning out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectFrameSlot {
+    Pending,
+    Current,
+}
+
+/// Decide, per output, whether a CRTC is displaying a directly-flipped client
+/// buffer and which retained frame it is — or the compositor's own scanout BO.
+///
+/// A direct transaction is submitted to every CRTC at once
+/// (`submit_direct_frame` builds one plane state per `platform.outputs`
+/// entry), but retirement and the composed unflip are per-CRTC, so the two
+/// transitions leave a window where outputs disagree:
+///
+/// * `pending_awaiting` holds the outputs whose flip has NOT retired yet.
+///   Those still show the predecessor (`current`, or the composed pool if this
+///   is the first direct frame); the rest already show `pending`.
+/// * `unflip_awaiting` holds the outputs whose composed replacement has NOT
+///   retired yet. Those are still direct; an output missing from a non-empty
+///   set has already been handed back to its pool BO. The set is emptied when
+///   the unflip fully retires, which also drops both frames.
+fn direct_frame_slot_on_output(
+    output_idx: usize,
+    pending_awaiting: Option<&HashSet<usize>>,
+    current_present: bool,
+    unflip_awaiting: &HashSet<usize>,
+) -> Option<DirectFrameSlot> {
+    if !unflip_awaiting.is_empty() && !unflip_awaiting.contains(&output_idx) {
+        return None;
+    }
+    if pending_awaiting.is_some_and(|awaiting| !awaiting.contains(&output_idx)) {
+        return Some(DirectFrameSlot::Pending);
+    }
+    current_present.then_some(DirectFrameSlot::Current)
+}
+
 fn phase_b_flip_in_flight_for_scheduler(
     scene_flip_pending: bool,
     direct_flip_pending: bool,
@@ -2274,6 +2311,29 @@ impl KmsBackend {
                 original
             }
             Err(relight_error) => relight_error,
+        }
+    }
+
+    /// The direct frame output `output_idx`'s CRTC is scanning out right now,
+    /// or `None` when that CRTC is showing its own composited scanout BO.
+    ///
+    /// Every on-screen READ has to go through this: while a CRTC scans out a
+    /// client buffer directly, its pool BOs are not painted at all (see
+    /// `retire_direct_output`'s `invalidate_all_scanout_damage`), so reading
+    /// the pool returns arbitrarily old content that is not on screen.
+    fn direct_scanout_frame_for_output(&self, output_idx: usize) -> Option<&DirectPresentFrame> {
+        let slot = direct_frame_slot_on_output(
+            output_idx,
+            self.scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| &frame.awaiting_outputs),
+            self.scanout_m2.current.is_some(),
+            &self.scanout_m2.unflip_awaiting_outputs,
+        )?;
+        match slot {
+            DirectFrameSlot::Pending => self.scanout_m2.pending.as_ref(),
+            DirectFrameSlot::Current => self.scanout_m2.current.as_ref(),
         }
     }
 
@@ -7151,7 +7211,20 @@ impl KmsBackend {
             return None;
         }
         Some(assemble_root_scanout(region, &outputs, |rect| {
-            read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly).ok()
+            // `assemble_root_scanout` zero-fills a piece it cannot read. That
+            // degradation is unchanged, but a failure here now also covers an
+            // unresolvable direct-scanout source, which previously answered
+            // with a stale composed BO instead — so say which rect went black.
+            match read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    log::warn!(
+                        "render root scanout readback: {rect:?} unreadable, \
+                         zero-filling that piece: {error}"
+                    );
+                    None
+                }
+            }
         }))
     }
 
@@ -15436,11 +15509,117 @@ fn scanout_selection_phases(
     }
 }
 
-fn select_scanout_bo_for_rect(
+/// Where an on-screen read of one rect actually has to come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanoutReadRoute {
+    /// The compositor's own scanout BO. `local` is the rect rebased into that
+    /// BO's coordinate space.
+    Pool {
+        pool_idx: usize,
+        bo_idx: usize,
+        local: vk::Rect2D,
+    },
+    /// A client drawable flipped directly onto this output's CRTC. `source` is
+    /// the rect rebased into that drawable's own coordinate space.
+    Direct {
+        source_id: DrawableId,
+        source_xid: u32,
+        depth: u8,
+        source: vk::Rect2D,
+    },
+}
+
+/// Which buffer a completed read came out of. Reported so a diagnostic dump
+/// can name it and a stale artifact can never be mistaken for the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanoutReadOrigin {
+    /// Degenerate read of an empty rect; no buffer was touched.
+    Empty,
+    ComposedPool {
+        pool_idx: usize,
+        bo_idx: usize,
+    },
+    DirectSource {
+        source_xid: u32,
+    },
+}
+
+impl ScanoutReadOrigin {
+    /// Short filename-safe tag naming the buffer that was read.
+    fn label(self) -> String {
+        match self {
+            Self::Empty => "empty".to_string(),
+            Self::ComposedPool { pool_idx, bo_idx } => {
+                format!("composed-pool{pool_idx}-bo{bo_idx}")
+            }
+            Self::DirectSource { source_xid } => format!("direct-src-0x{source_xid:x}"),
+        }
+    }
+}
+
+/// Rebase a root-absolute rect into the direct source drawable's own space.
+///
+/// The flipped source is blitted so that its `(0, 0)` lands at
+/// (`x_off`, `y_off`) of the root-covering paint target — the same mapping
+/// `materialize_direct_shadow_for_unflip` uses for its fallback Copy. M2
+/// eligibility pins that target to the root origin
+/// (`scanout_m2_is_authoritative_root`'s `root_coverage`) and both offsets to
+/// zero (`scanout_direct_eligible`), so today this is the identity; it is
+/// derived from the candidate anyway so relaxing either rule cannot silently
+/// shift the read.
+fn direct_scanout_route_for_rect(
+    backend: &KmsBackend,
+    output_idx: usize,
+    frame: &DirectPresentFrame,
+    rect: vk::Rect2D,
+) -> io::Result<ScanoutReadRoute> {
+    let source_xid = frame.candidate.src_host_xid;
+    let Some(drawable) = backend.store.get(frame.source_id) else {
+        return Err(io::Error::other(format!(
+            "output {output_idx} scans out direct source 0x{source_xid:x}, \
+             which is no longer in the drawable store"
+        )));
+    };
+    let depth = drawable.depth;
+    if !matches!(depth, 24 | 32) {
+        return Err(io::Error::other(format!(
+            "output {output_idx} direct source 0x{source_xid:x} has depth {depth}, \
+             which is not a 32-bit scanout layout"
+        )));
+    }
+    let extent = drawable.storage.extent;
+    let sx = i64::from(rect.offset.x) - i64::from(frame.candidate.x_off);
+    let sy = i64::from(rect.offset.y) - i64::from(frame.candidate.y_off);
+    if sx < 0
+        || sy < 0
+        || sx + i64::from(rect.extent.width) > i64::from(extent.width)
+        || sy + i64::from(rect.extent.height) > i64::from(extent.height)
+    {
+        return Err(io::Error::other(format!(
+            "output {output_idx} read rect {rect:?} falls outside direct source \
+             0x{source_xid:x} ({}x{} at +{}+{})",
+            extent.width, extent.height, frame.candidate.x_off, frame.candidate.y_off
+        )));
+    }
+    Ok(ScanoutReadRoute::Direct {
+        source_id: frame.source_id,
+        source_xid,
+        depth,
+        source: vk::Rect2D {
+            offset: vk::Offset2D {
+                x: i32::try_from(sx).unwrap_or(i32::MAX),
+                y: i32::try_from(sy).unwrap_or(i32::MAX),
+            },
+            extent: rect.extent,
+        },
+    })
+}
+
+fn select_scanout_read_route(
     backend: &KmsBackend,
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
-) -> io::Result<(usize, usize, vk::Rect2D)> {
+) -> io::Result<ScanoutReadRoute> {
     let rx0 = i64::from(rect.offset.x);
     let ry0 = i64::from(rect.offset.y);
     let rx1 = rx0 + i64::from(rect.extent.width);
@@ -15454,6 +15633,13 @@ fn select_scanout_bo_for_rect(
         let ly1 = ly0 + i64::from(layout.height);
         if rx0 < lx0 || ry0 < ly0 || rx1 > lx1 || ry1 > ly1 {
             continue;
+        }
+        // A directly-flipped CRTC is not compositing into its pool at all, so
+        // the pool BO under this rect is not what the user is looking at.
+        // Never fall through to it: an unresolvable direct source is an error,
+        // not a licence to return stale composed pixels.
+        if let Some(frame) = backend.direct_scanout_frame_for_output(pool_idx) {
+            return direct_scanout_route_for_rect(backend, pool_idx, frame, rect);
         }
         let Some(pool) = backend
             .platform
@@ -15473,7 +15659,11 @@ fn select_scanout_bo_for_rect(
                     },
                     extent: rect.extent,
                 };
-                return Ok((pool_idx, bo_idx, local));
+                return Ok(ScanoutReadRoute::Pool {
+                    pool_idx,
+                    bo_idx,
+                    local,
+                });
             }
         }
     }
@@ -15500,7 +15690,7 @@ struct RootScanoutRead {
 /// root-source `CopyArea` into per-output scanout reads.
 ///
 /// `read_scanout_region(OnScreenOnly)` rejects any rect that is partially
-/// off-screen or spans two outputs (`select_scanout_bo_for_rect` requires the
+/// off-screen or spans two outputs (`select_scanout_read_route` requires the
 /// rect to sit fully inside one output BO). So for each output we intersect the
 /// requested root-absolute source region with the output's bounds and emit one
 /// read per non-empty piece. Source area not covered by any output is dropped
@@ -15555,7 +15745,7 @@ fn split_root_scanout_reads(
 ///
 /// The plain root `GetImage` path — unlike `CopyArea`-from-root, which already
 /// splits — used to issue ONE `read_scanout_region` for the whole rect.
-/// `select_scanout_bo_for_rect` rejects any rect that isn't fully inside a
+/// `select_scanout_read_route` rejects any rect that isn't fully inside a
 /// single output, so a multi-monitor full-root grab matched no BO and the reply
 /// came back all-black (ImageMagick `import` screenshots over a dual-head root:
 /// `import` grabs the entire root, then crops client-side). Split the region
@@ -15616,11 +15806,73 @@ fn read_scanout_region(
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<Vec<u8>> {
+    read_scanout_region_named(backend, rect, selection).map(|(bytes, _)| bytes)
+}
+
+/// Read what is actually on screen under `rect`, and say which buffer it came
+/// from. Reads the directly-flipped client drawable when the covering CRTC is
+/// in direct scanout, and the composited BO otherwise.
+fn read_scanout_region_named(
+    backend: &mut KmsBackend,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+) -> io::Result<(Vec<u8>, ScanoutReadOrigin)> {
     use crate::kms::vk::ops::run_one_shot_op_with_wait;
 
     if rect.extent.width == 0 || rect.extent.height == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), ScanoutReadOrigin::Empty));
     }
+
+    let (pool_idx, bo_idx, local_rect) = match select_scanout_read_route(backend, rect, selection)?
+    {
+        ScanoutReadRoute::Pool {
+            pool_idx,
+            bo_idx,
+            local,
+        } => (pool_idx, bo_idx, local),
+        ScanoutReadRoute::Direct {
+            source_id,
+            source_xid,
+            depth,
+            source,
+        } => {
+            // Exactly the per-drawable read `do_dump_drawables` uses for its
+            // `present-src` targets, which was measured to match the screen
+            // while the pool read did not. `engine.get_image` returns the same
+            // BGRA8 4-byte layout the pool copy below produces.
+            let bytes = backend
+                .engine
+                .get_image(
+                    &mut backend.store,
+                    &mut backend.platform,
+                    Src::server_internal(source_id),
+                    source,
+                    depth,
+                )
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "direct scanout source 0x{source_xid:x} readback: {error:?}"
+                    ))
+                })?;
+            let expected = usize::try_from(source.extent.width)
+                .ok()
+                .and_then(|w| {
+                    usize::try_from(source.extent.height)
+                        .ok()
+                        .and_then(|h| w.checked_mul(h))
+                })
+                .and_then(|px| px.checked_mul(4))
+                .ok_or_else(|| io::Error::other("direct scanout read size overflow"))?;
+            if bytes.len() != expected {
+                return Err(io::Error::other(format!(
+                    "direct scanout source 0x{source_xid:x} returned {} bytes for {:?}, expected {expected}",
+                    bytes.len(),
+                    source,
+                )));
+            }
+            return Ok((bytes, ScanoutReadOrigin::DirectSource { source_xid }));
+        }
+    };
 
     let Some(vk) = backend.platform.vk.as_ref().cloned() else {
         return Err(io::Error::other("no vulkan context"));
@@ -15629,7 +15881,6 @@ fn read_scanout_region(
         return Err(io::Error::other("no ops command pool"));
     };
 
-    let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
     let copy_width = local_rect.extent.width;
     let copy_height = local_rect.extent.height;
     let needed_bytes = usize::try_from(copy_width)
@@ -15768,7 +16019,10 @@ fn read_scanout_region(
     }
 
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
-    Ok(raw.to_vec())
+    Ok((
+        raw.to_vec(),
+        ScanoutReadOrigin::ComposedPool { pool_idx, bo_idx },
+    ))
 }
 
 fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
@@ -15794,16 +16048,33 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
                 height: u32::from(height),
             },
         };
-        let raw = match read_scanout_region(backend, rect, ScanoutReadSelection::PermissiveDump) {
-            Ok(raw) => raw,
-            Err(err) => {
-                log::warn!("render do_dump_scanout: output {pool_idx} failed: {err}");
-                last_err = Some(err);
-                continue;
-            }
-        };
+        let (raw, origin) =
+            match read_scanout_region_named(backend, rect, ScanoutReadSelection::PermissiveDump) {
+                Ok(read) => read,
+                Err(err) => {
+                    // Never leave the previous run's file (or nothing at all)
+                    // standing in for an unreadable output: an unreadable
+                    // direct source is exactly the case that used to be
+                    // silently answered with a stale composed BO.
+                    log::warn!("render do_dump_scanout: output {pool_idx} failed: {err}");
+                    let marker = format!("./yserver-scanout-{run}-out{pool_idx}-UNREADABLE.txt");
+                    if let Err(write_err) = std::fs::write(
+                        &marker,
+                        format!("output {pool_idx} {width}x{height} at +{x}+{y}: {err}\n"),
+                    ) {
+                        log::warn!("render do_dump_scanout: write {marker}: {write_err}");
+                    }
+                    last_err = Some(err);
+                    continue;
+                }
+            };
 
-        let path = format!("./yserver-scanout-{run}-out{pool_idx}.ppm");
+        // The filename names the buffer that was actually read, so a dump
+        // taken during direct scanout can never be mistaken for a composed one.
+        let path = format!(
+            "./yserver-scanout-{run}-out{pool_idx}-{}.ppm",
+            origin.label()
+        );
         use std::io::Write;
         let mut file = std::fs::File::create(&path)?;
         file.write_all(format!("P6\n{width} {height}\n255\n").as_bytes())?;
@@ -39595,6 +39866,160 @@ mod tests {
         );
     }
 
+    /// Retain `source_xid` as a fully-retired direct frame on every output —
+    /// the state `try_present_direct` reaches after its flip retires, without
+    /// the DRM transaction. `source_xid` stands in for the client buffer the
+    /// CRTCs are scanning out; the compositor's pools are left untouched,
+    /// which is exactly what happens on hardware.
+    fn retain_direct_frame_from_source_test(
+        b: &mut super::KmsBackend,
+        source_xid: u32,
+        fallback_xid: u32,
+        width: u16,
+        height: u16,
+    ) {
+        use yserver_core::backend::{
+            CompletedPresentEvent, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+            PresentWake,
+        };
+
+        let source_id = b.store.lookup(source_xid).expect("direct source drawable");
+        let fallback_id = b.store.lookup(fallback_xid).expect("fallback drawable");
+        let source_pin = b.pin_direct_source(source_id);
+        let fallback_target_pin = b.pin_direct_source(fallback_id);
+        let completion_clock = Some(PresentClockSample {
+            msc: 3,
+            ust: 300,
+            source: PresentClockSource::PageFlip,
+        });
+        b.scanout_m2.current = Some(super::DirectPresentFrame {
+            source_pin,
+            fallback_target_pin,
+            source_id,
+            candidate: PresentScanoutCandidate {
+                client_id: 1,
+                present_id: 3,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                src_pixmap_xid: source_xid,
+                dst_window_xid: fallback_xid,
+                src_host_xid: source_xid,
+                paint_dst_host_xid: fallback_xid,
+                completion_dst_host_xid: fallback_xid,
+                src_width: width,
+                src_height: height,
+                x_off: 0,
+                y_off: 0,
+                valid_region_xid: 0,
+                update_region_xid: 0,
+                update_is_full: true,
+                explicit_sync: false,
+                options: 0,
+            },
+            fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            event: CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(1),
+                serial: 1,
+                host_xid: source_xid,
+                dst_host_xid: fallback_xid,
+                options: 0,
+                present_id: 3,
+                window_generation: 1,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
+                emit_idle: false,
+            },
+            completion_output_idx: 0,
+            completion_clock,
+            awaiting_outputs: std::collections::HashSet::new(),
+        });
+        b.scanout_m2.hold_direct = true;
+    }
+
+    /// Protocol-visible half of the direct-scanout stale-read bug: a
+    /// root-source read (here root `GetImage`, which shares
+    /// `read_root_scanout_assembled` with root-source `CopyArea` and the root
+    /// screenshot pixmap) must return the flipped client buffer.
+    ///
+    /// The fixture has a live render engine but NO scanout pools
+    /// (`for_tests_with_vk_live_scene`, the only fixture that allocates them,
+    /// needs a real DRM device and skips on lavapipe), so the composed route
+    /// here can only fail and zero-fill. That is what makes the assertion
+    /// bite: before the fix this read went to the pool unconditionally and
+    /// came back all-black. The composed-versus-direct A/B on the same live
+    /// pool needs hardware.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn root_read_during_direct_scanout_returns_the_flipped_source() {
+        use yserver_core::backend::Backend;
+
+        let mut backend = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let (fb_w, fb_h) = (backend.platform.fb_w, backend.platform.fb_h);
+
+        let read = |b: &mut KmsBackend| {
+            b.get_image_pixels_for_tests(b.core.window_id, 2, 32, 24, 16, 16, !0)
+                .expect("root get_image")
+                .expect("root bytes")
+        };
+        let bgr = |bytes: &[u8]| -> Vec<[u8; 3]> {
+            bytes.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect()
+        };
+
+        // Control: with no direct frame the read takes the composed route,
+        // which this fixture cannot satisfy, so every piece zero-fills.
+        let composed = read(&mut backend);
+        assert_eq!(composed.len(), 16 * 16 * 4);
+        assert!(
+            bgr(&composed).iter().all(|px| *px == [0, 0, 0]),
+            "control: the composed route has no pool bo here"
+        );
+
+        // A client buffer the size of the root, flipped straight onto the
+        // CRTC. The compositor never composes it.
+        let direct_color = 0x00aa_55ff_u32;
+        let expected = [
+            u8::try_from(direct_color & 0xff).unwrap(),
+            u8::try_from((direct_color >> 8) & 0xff).unwrap(),
+            u8::try_from((direct_color >> 16) & 0xff).unwrap(),
+        ];
+        let source = backend
+            .create_pixmap(None, 24, fb_w, fb_h)
+            .expect("direct source pixmap");
+        let source_xid = source.as_raw();
+        backend
+            .fill_rectangle(None, source_xid, direct_color, 0, 0, fb_w, fb_h)
+            .expect("fill direct source");
+        let root_xid = backend.core.window_id;
+        retain_direct_frame_from_source_test(&mut backend, source_xid, root_xid, fb_w, fb_h);
+
+        let direct = read(&mut backend);
+        assert_eq!(direct.len(), 16 * 16 * 4);
+        assert!(
+            bgr(&direct).iter().all(|px| *px == expected),
+            "a root read during direct scanout must return the flipped source's \
+             pixels; got {:?}",
+            bgr(&direct).first()
+        );
+
+        // Dropping the direct frame puts the read back on the composed route.
+        backend.scanout_m2.current = None;
+        backend.scanout_m2.hold_direct = false;
+        assert!(
+            bgr(&read(&mut backend)).iter().all(|px| *px == [0, 0, 0]),
+            "the composed route must come back once the CRTC is unflipped"
+        );
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn root_overlay_xor_pass_reaches_scanout() {
@@ -39961,6 +40386,247 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].read, r(20, 10, 30, 30));
         assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 20, y: 10 });
+    }
+
+    // ── Direct scanout: an on-screen read must follow the flipped source ──
+    //
+    // While a CRTC scans out a client buffer directly its pool BOs are not
+    // painted at all, so a pool read answers with content that is not on
+    // screen and can be arbitrarily old.
+
+    fn outputs_set(indices: &[usize]) -> std::collections::HashSet<usize> {
+        indices.iter().copied().collect()
+    }
+
+    #[test]
+    fn direct_frame_slot_is_composed_without_any_direct_frame() {
+        assert_eq!(
+            super::direct_frame_slot_on_output(0, None, false, &outputs_set(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_frame_slot_current_covers_every_output() {
+        for idx in 0..2 {
+            assert_eq!(
+                super::direct_frame_slot_on_output(idx, None, true, &outputs_set(&[])),
+                Some(super::DirectFrameSlot::Current),
+                "a fully retired direct frame is on screen on every CRTC"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_frame_slot_pending_only_on_outputs_where_it_retired() {
+        // Successor submitted to both CRTCs, retired on output 0 only.
+        let awaiting = outputs_set(&[1]);
+        assert_eq!(
+            super::direct_frame_slot_on_output(0, Some(&awaiting), true, &outputs_set(&[])),
+            Some(super::DirectFrameSlot::Pending)
+        );
+        assert_eq!(
+            super::direct_frame_slot_on_output(1, Some(&awaiting), true, &outputs_set(&[])),
+            Some(super::DirectFrameSlot::Current),
+            "output 1 still shows the predecessor until its flip retires"
+        );
+    }
+
+    #[test]
+    fn direct_frame_slot_first_direct_frame_leaves_unretired_outputs_composed() {
+        // No predecessor: an output that has not retired the first direct
+        // flip is still compositing into its own pool.
+        let awaiting = outputs_set(&[1]);
+        assert_eq!(
+            super::direct_frame_slot_on_output(0, Some(&awaiting), false, &outputs_set(&[])),
+            Some(super::DirectFrameSlot::Pending)
+        );
+        assert_eq!(
+            super::direct_frame_slot_on_output(1, Some(&awaiting), false, &outputs_set(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_frame_slot_composed_unflip_retires_per_output() {
+        // Composed unflip submitted to both CRTCs, retired on output 0 only.
+        let unflip = outputs_set(&[1]);
+        assert_eq!(
+            super::direct_frame_slot_on_output(0, None, true, &unflip),
+            None,
+            "output 0 is back on its composited BO"
+        );
+        assert_eq!(
+            super::direct_frame_slot_on_output(1, None, true, &unflip),
+            Some(super::DirectFrameSlot::Current),
+            "output 1 is still scanning out the client buffer"
+        );
+    }
+
+    #[test]
+    fn scanout_read_route_follows_the_direct_source() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5700;
+        let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
+        let (source_id, _, _, _) =
+            install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
+
+        let route = super::select_scanout_read_route(
+            &b,
+            r(10, 20, 30, 40),
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("a flipped CRTC resolves a direct route");
+        match route {
+            super::ScanoutReadRoute::Direct {
+                source_id: got,
+                depth,
+                source,
+                ..
+            } => {
+                assert_eq!(got, source_id, "must read the flipped source drawable");
+                assert_eq!(depth, 24);
+                assert_eq!(
+                    source,
+                    r(10, 20, 30, 40),
+                    "x_off/y_off are pinned to zero, so root-absolute maps 1:1"
+                );
+            }
+            other => panic!("expected a direct route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scanout_read_route_is_composed_once_the_direct_frame_is_gone() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5704;
+        let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
+        b.scanout_m2.current = None;
+
+        // The stub fixture has no scanout pools, so the composed branch can
+        // only report "not covered by any pool" — which is still proof the
+        // direct branch was not taken.
+        let err = super::select_scanout_read_route(
+            &b,
+            r(10, 20, 30, 40),
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect_err("stub fixture has no pool bos");
+        assert!(
+            err.to_string().contains("not covered by any pool"),
+            "expected the composed-pool branch, got {err}"
+        );
+    }
+
+    #[test]
+    fn scanout_read_route_rejects_a_rect_outside_the_direct_source() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5708;
+        let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
+
+        // The fixture source is 100x100; the output is 800x600.
+        let err = super::select_scanout_read_route(
+            &b,
+            r(0, 0, 800, 600),
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect_err("an unreadable direct source must not fall back to the pool");
+        assert!(
+            err.to_string().contains("falls outside direct source"),
+            "expected the direct-source bounds error, got {err}"
+        );
+    }
+
+    #[test]
+    fn scanout_read_route_rejects_a_vanished_direct_source() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x570c;
+        let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
+        b.scanout_m2
+            .current
+            .as_mut()
+            .expect("direct frame installed")
+            .source_id = crate::kms::render::store::DrawableId::for_tests(0x00ff_ffff);
+
+        let err = super::select_scanout_read_route(
+            &b,
+            r(10, 20, 30, 40),
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect_err("an unresolvable direct source must be reported, not papered over");
+        assert!(
+            err.to_string().contains("no longer in the drawable store"),
+            "expected the missing-source error, got {err}"
+        );
+    }
+
+    #[test]
+    fn scanout_read_route_is_per_output_during_a_composed_unflip() {
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        // Two side-by-side outputs small enough to sit inside the fixture's
+        // 100x100 direct source, which stands in for the real invariant that
+        // a direct source spans the whole root framebuffer.
+        for (idx, x) in [(0usize, 0i32), (1usize, 50i32)] {
+            b.platform.outputs[idx].x = x;
+            b.platform.outputs[idx].y = 0;
+            b.platform.outputs[idx].width = 50;
+            b.platform.outputs[idx].height = 50;
+        }
+        let target_xid = 0x5710;
+        let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
+        // Composed unflip retired on output 0, still awaited on output 1.
+        b.scanout_m2.unflip_awaiting_outputs = outputs_set(&[1]);
+
+        assert!(
+            b.direct_scanout_frame_for_output(0).is_none(),
+            "output 0 went back to its composited BO"
+        );
+        assert!(
+            b.direct_scanout_frame_for_output(1).is_some(),
+            "output 1 is still scanning out the client buffer"
+        );
+
+        // A rect wholly inside output 1 still resolves to the direct source,
+        // rebased into that drawable's own space (the source covers the whole
+        // root, so the output origin is NOT subtracted).
+        let route = super::select_scanout_read_route(
+            &b,
+            r(60, 10, 20, 20),
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("output 1 is direct");
+        match route {
+            super::ScanoutReadRoute::Direct { source, .. } => assert_eq!(
+                source,
+                r(60, 10, 20, 20),
+                "the source spans the root, so the output origin is NOT subtracted"
+            ),
+            other => panic!("expected a direct route on the still-flipped output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scanout_read_origin_labels_name_the_buffer() {
+        assert_eq!(
+            super::ScanoutReadOrigin::ComposedPool {
+                pool_idx: 1,
+                bo_idx: 2
+            }
+            .label(),
+            "composed-pool1-bo2"
+        );
+        assert_eq!(
+            super::ScanoutReadOrigin::DirectSource {
+                source_xid: 0x4a0_0007
+            }
+            .label(),
+            "direct-src-0x4a00007"
+        );
     }
 
     /// Register a client in `state.clients` so `process_request`'s

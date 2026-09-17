@@ -33,6 +33,42 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-17 on-screen reads follow the directly-flipped buffer:** while a
+  CRTC scans out a client buffer directly, the compositor's pool BOs are not
+  painted at all (`retire_direct_output` calls `invalidate_all_scanout_damage`
+  on the way back for exactly that reason), but every scanout READ still went
+  to the pool. A measured session: the Ctrl-Alt-Enter dumps matched the COW
+  storage 100.00% and the live direct source only 7.68%, with the direct
+  source holding what was actually on screen; direct scanout had been up ~65s
+  with zero composed-unflip events. `select_scanout_bo_for_rect` is now
+  `select_scanout_read_route`, which asks `direct_scanout_frame_for_output`
+  first and reads the flipped source drawable via
+  `engine.get_image(Src::server_internal(source_id), …)` — the same read
+  `do_dump_drawables` uses for its `present-src` targets. This is protocol-
+  visible: root `GetImage`, root-source `CopyArea(IncludeInferiors)` and the
+  root screenshot pixmap all go through `read_root_scanout_assembled`.
+  Per-output, because a direct flip and the composed unflip both retire
+  per-CRTC: `direct_frame_slot_on_output` picks pending/current/composed from
+  `pending.awaiting_outputs` + `unflip_awaiting_outputs`. The rect maps into
+  the source by subtracting `candidate.x_off/y_off` — the identity today,
+  since M2 eligibility pins a direct source to the whole root at the root
+  origin, but derived rather than assumed. An unresolvable direct source is an
+  ERROR, never a fall-through to the pool: the dump writes
+  `yserver-scanout-<run>-out<i>-UNREADABLE.txt` and the protocol path keeps
+  the existing zero-fill/skip degradation, now with a warn naming the rect.
+  Dump filenames gained the buffer they came from —
+  `yserver-scanout-<run>-out<i>-{composed-pool<p>-bo<b>|direct-src-0x<xid>}.ppm`
+  — so a stale artifact can never be mistaken for the screen again; every
+  in-tree consumer (`tools/vng-shot.sh`, `tools/e16-hover-repro.sh`,
+  `tools/ppm-regions.py`) globs `yserver-scanout-*.ppm` and is unaffected.
+  NOT touched: the unflip policy itself. Note for test work —
+  `for_tests_with_vk_live_scene` cannot allocate a scanout BO pool on
+  lavapipe, so every lib test built on it (including the pre-existing
+  `root_get_image_reads_scanout_pixels_not_root_storage`) skips vacuously
+  there; the new pixel test uses `for_tests_with_vk` instead, where the
+  composed route has no pool and can only zero-fill, which is what makes the
+  direct assertion bite.
+
 - **2026-09-16 #143 follow-up, awesome borders on bee:** the drawable dump
   exposed two separate failures. The frame backing already contained title-bar
   pixels in its top/left border: core `CopyArea` substituted the redirect
