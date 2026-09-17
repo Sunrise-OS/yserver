@@ -1533,6 +1533,45 @@ fn rotate_redirected_backing_on_resize(
             );
         }
     }
+
+    // #143 — report protocol DAMAGE over the ring the reallocate above
+    // just repainted, at the NEW geometry.
+    //
+    // This is the realloc path only, and that is exactly Xorg's gate:
+    // `compReallocPixmap` allocates a new pixmap only when the BORDERED
+    // extent differs (`pix_w != pOld->drawable.width || pix_h !=
+    // pOld->drawable.height`, `../xserver/composite/compalloc.c:698`,
+    // with `pix_w = w + (bw << 1)`), and only that branch calls
+    // `compSetPixmap(pWin, pNew, bw)` (`:700`). `compSetPixmapVisitWindow`
+    // then queues `compRepaintBorder` whenever `bw != 0`
+    // (`../xserver/composite/compwindow.c:137-139`), which subtracts
+    // `winSize` from `borderClip` and `PaintWindow(..., PW_BORDER)`s the
+    // difference (`:113-117`). That paint is an ordinary `PolyFillRect`
+    // on the window's pixmap (`../xserver/mi/miexpose.c:558`), so
+    // `damagePolyFillRect` (`../xserver/miext/damage/damage.c:1194`)
+    // reports it. The same-extent branch (`compalloc.c:702-705`) keeps
+    // `pOld`, never calls `compSetPixmap` and therefore reports nothing —
+    // which is our `redirected_backing_can_fit` early-return above,
+    // deliberately an EXACT extent match (`kms/render/backend.rs:20563`).
+    //
+    // Ordering matches Xorg's too: `compCopyWindow` carries the bits
+    // across first and the border repaint is a WorkProc that runs after,
+    // so the ring is always the freshly painted one.
+    //
+    // We only damage the NEW ring. The region the OLD ring vacated on a
+    // shrink lies outside the window's new outer extent, i.e. in the
+    // PARENT's area, and Xorg reports it against the parent, never
+    // against the shrinking window: `miComputeClips` puts the vacated
+    // area into `pParent->valdata->after.exposed`
+    // (`../xserver/mi/mivaltree.c:453-460`) and
+    // `miHandleValidateExposures` hands it to `miWindowExposures`
+    // (`../xserver/mi/miwindow.c:226`), which paints the PARENT's
+    // background over it (`../xserver/mi/miexpose.c:387`) — a GC op on
+    // the parent's drawable, so the damage lands on the parent.
+    //
+    // No-op for an unbordered window, for the root and for a
+    // non-viewable one (the gate lives in `accumulate_damage_to_state`).
+    let _dropped = accumulate_damage_border_to_state(state, window);
 }
 
 fn effective_redirect_mode_for_window(
@@ -64629,6 +64668,239 @@ mod tests {
             assert!(
                 state.damage_objects[&DAMAGE_XID].rects.is_empty(),
                 "bw={bw} mapped={map}: no ring to report",
+            );
+        }
+    }
+
+    /// #143, the resize half. `5d7270c1` reported the ring on a
+    /// border-source change and on backing activation; a RESIZE
+    /// repaints it too — `rotate_redirected_backing_on_resize`
+    /// reallocates and `allocate_redirected_backing` paints the new
+    /// ring — and reported nothing, so a partial-repaint compositor
+    /// (picom on `EXT_buffer_age`) kept a ring at the OLD extent in one
+    /// back buffer and the new one in the other. The bottom and right
+    /// strips are the ones that move when a window is resized about a
+    /// fixed origin, which is exactly the observed fingerprint: those
+    /// two edges flickered at awesome's ~1 Hz clock tick and settled
+    /// gone.
+    ///
+    /// Xorg reports it: `compReallocPixmap` reallocates whenever the
+    /// bordered extent differs (`composite/compalloc.c:698`) and that
+    /// branch alone calls `compSetPixmap` (`:700`), whose visitor
+    /// queues `compRepaintBorder` for `bw != 0`
+    /// (`composite/compwindow.c:137-139`) — a `PolyFillRect` on the
+    /// window pixmap (`mi/miexpose.c:558`) that `damagePolyFillRect`
+    /// (`miext/damage/damage.c:1194`) reports.
+    ///
+    /// bw = 2 and the captured 1276x704, shrunk and grown.
+    #[test]
+    fn configure_window_resize_damages_the_ring_at_the_new_geometry() {
+        use crate::{
+            resources::RedirectedBacking,
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use yserver_protocol::x11::xfixes::RegionRect;
+        const DAMAGE_XID: u32 = 0x0080_9145;
+        const BW: u16 = 2;
+        // (old_w, old_h, new_w, new_h, label)
+        for (old_w, old_h, new_w, new_h, label) in [
+            (1276u16, 704u16, 636u16, 348u16, "shrink"),
+            (636, 348, 1276, 704, "grow"),
+        ] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let win = ResourceId(0x0080_0001);
+            seed_window(&mut state, win, ROOT_WINDOW, old_w, old_h);
+            if let Some(w) = state.resources.window_mut(win) {
+                w.border_width = BW;
+                w.redirected_backing = Some(RedirectedBacking {
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0x0050_0001),
+                    width: old_w + 2 * BW,
+                    height: old_h + 2 * BW,
+                    depth: 24,
+                });
+            }
+            assert!(state.resources.map_window(win), "window must map");
+            state.composite_redirects.insert(
+                (win, false),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            );
+            // ReportLevel Raw, so `rects` keeps the real strips instead
+            // of the NonEmpty full-extent substitute.
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: win,
+                    level: 0,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+
+            // ConfigureWindow, CWWidth | CWHeight.
+            let mut body = Vec::with_capacity(16);
+            body.extend_from_slice(&win.0.to_le_bytes());
+            body.extend_from_slice(&0x000cu16.to_le_bytes());
+            body.extend_from_slice(&[0u8; 2]);
+            body.extend_from_slice(&u32::from(new_w).to_le_bytes());
+            body.extend_from_slice(&u32::from(new_h).to_le_bytes());
+            run_border_request(&mut state, 12, 0, &body);
+
+            let rects = state.damage_objects[&DAMAGE_XID].rects.clone();
+            let bw = i16::try_from(BW).unwrap();
+            let ring = [
+                RegionRect {
+                    x: -bw,
+                    y: -bw,
+                    width: new_w + 2 * BW,
+                    height: BW,
+                },
+                RegionRect {
+                    x: -bw,
+                    y: 0,
+                    width: BW,
+                    height: new_h,
+                },
+                RegionRect {
+                    x: i16::try_from(new_w).unwrap(),
+                    y: 0,
+                    width: BW,
+                    height: new_h,
+                },
+                RegionRect {
+                    x: -bw,
+                    y: i16::try_from(new_h).unwrap(),
+                    width: new_w + 2 * BW,
+                    height: BW,
+                },
+            ];
+            assert_eq!(
+                rects.get(..4),
+                Some(&ring[..]),
+                "{label}: a resize must damage the whole ring at the NEW \
+                 geometry, before the full-extent configure damage, and the \
+                 top/left strips carry NEGATIVE origins; got {rects:?}",
+            );
+            // The bottom and right strips are the ones whose position
+            // MOVED — the #143 fingerprint. Spell them out so a
+            // regression that reports the ring at the OLD extent fails
+            // here and not only on the ordering assert above.
+            assert!(
+                rects.contains(&ring[2]) && rects.contains(&ring[3]),
+                "{label}: the right and bottom strips must sit at the NEW \
+                 extent ({new_w}x{new_h}), not the old one ({old_w}x{old_h})",
+            );
+            assert!(
+                rects.contains(&RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: new_w,
+                    height: new_h,
+                }),
+                "{label}: the pre-existing full-extent configure damage must \
+                 still fire alongside the ring",
+            );
+
+            // And it reaches the client, negative origins intact on the
+            // wire (`area.x`/`area.y` are INT16 at bytes 16..20).
+            let bytes = read_all_available(&mut peer);
+            let areas: Vec<(i16, i16, u16, u16)> = bytes
+                .chunks_exact(32)
+                .filter(|c| c[0] == crate::nested::DAMAGE_FIRST_EVENT)
+                .map(|c| {
+                    (
+                        i16::from_le_bytes([c[16], c[17]]),
+                        i16::from_le_bytes([c[18], c[19]]),
+                        u16::from_le_bytes([c[20], c[21]]),
+                        u16::from_le_bytes([c[22], c[23]]),
+                    )
+                })
+                .collect();
+            for r in &ring {
+                assert!(
+                    areas.contains(&(r.x, r.y, r.width, r.height)),
+                    "{label}: ring strip {r:?} must arrive as a DamageNotify, got {areas:?}",
+                );
+            }
+        }
+    }
+
+    /// The resize ring damage follows the same two Xorg gates as the
+    /// border-source one — nothing at `bw == 0` (`HasBorder(pWin)`) and
+    /// nothing for a non-viewable window (`pWin->viewable`,
+    /// `dix/window.c:1586`) — so an unbordered resize keeps reporting
+    /// exactly the one full-extent rect it always did.
+    #[test]
+    fn configure_window_resize_damages_no_ring_unbordered_or_unmapped() {
+        use crate::{
+            resources::RedirectedBacking,
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use yserver_protocol::x11::xfixes::RegionRect;
+        const DAMAGE_XID: u32 = 0x0080_9146;
+        for (bw, map) in [(0u16, true), (2, false)] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let win = ResourceId(0x0080_0001);
+            seed_window(&mut state, win, ROOT_WINDOW, 128, 64);
+            if let Some(w) = state.resources.window_mut(win) {
+                w.border_width = bw;
+                w.redirected_backing = Some(RedirectedBacking {
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0x0050_0001),
+                    width: 128 + 2 * bw,
+                    height: 64 + 2 * bw,
+                    depth: 24,
+                });
+            }
+            if map {
+                assert!(state.resources.map_window(win), "window must map");
+            }
+            state.composite_redirects.insert(
+                (win, false),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            );
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: win,
+                    level: 0,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+
+            let mut body = Vec::with_capacity(16);
+            body.extend_from_slice(&win.0.to_le_bytes());
+            body.extend_from_slice(&0x000cu16.to_le_bytes());
+            body.extend_from_slice(&[0u8; 2]);
+            body.extend_from_slice(&64u32.to_le_bytes());
+            body.extend_from_slice(&32u32.to_le_bytes());
+            run_border_request(&mut state, 12, 0, &body);
+            assert_no_error(&read_all_available(&mut peer), "ConfigureWindow resize");
+
+            let expected: Vec<RegionRect> = if map {
+                vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 32,
+                }]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                state.damage_objects[&DAMAGE_XID].rects, expected,
+                "bw={bw} mapped={map}: no ring to report on a resize",
             );
         }
     }
