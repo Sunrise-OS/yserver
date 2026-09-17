@@ -14653,19 +14653,25 @@ fn a_child_at_a_nonzero_offset_in_a_bordered_parent_keeps_its_full_extent() {
 // copies whatever the window's leaf holds, and these tests show it
 // arriving intact. What loses it is the WM retile that happens while
 // the window is still unredirected: `configure_subwindow` reallocated
-// the leaf and discarded the pixels, and on a SHRINK the client is
-// never told (we emit no Expose there, which is what Xorg does only
-// when bit gravity recovered the bits — `mi/miwindow.c:466-472`), so an
-// idle client never repaints and the window stays broken through the
-// redirect and forever after.
+// the leaf and discarded the pixels, and on a SHRINK the client was
+// never told, so an idle client never repainted and the window stayed
+// broken through the redirect and forever after. Both halves are fixed
+// now: a background-None window keeps its pixels, and every resize
+// reports the whole window exposed as Xorg's `miResizeWindow` does
+// (`mi/miwindow.c:466-472`).
 
-/// A shrink keeps the client's pixels, because nothing else will bring
-/// them back: no Expose is emitted for a shrink, so a discard is
-/// unrecoverable. Both halves are asserted here — the pixels AND the
-/// silence — so the day the Expose side is fixed this test says so.
+/// A shrink keeps a background-None window's pixels AND still tells the
+/// client what was exposed. Xorg does both, in that order: the paint
+/// returns without touching a pixel when the window has no background
+/// (`mi/miexpose.c:438-440`) but `miWindowExposures` sends the
+/// exposures regardless (`mi/miexpose.c:387-389`).
+///
+/// This test asserted ZERO Exposes until the shrink-Expose fix — that
+/// was our behaviour, not Xorg's, and it is what left #143's xterm
+/// black. The pixel half is unchanged.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn a_shrink_keeps_the_content_it_never_exposes() {
+fn a_shrink_exposes_and_keeps_the_content_of_a_background_none_window() {
     use std::io::Read;
     const W: u32 = 0x1430;
     const GC: u32 = 0x1431;
@@ -14705,11 +14711,23 @@ fn a_shrink_keeps_the_content_it_never_exposes() {
 
     let mut buf = [0u8; 65536];
     let n = f._peer.read(&mut buf).unwrap_or(0);
-    let exposes = (0..n / 32).filter(|k| buf[k * 32] & 0x7f == 12).count();
+    let exposes: Vec<(u16, u16, u16, u16)> = (0..n / 32)
+        .map(|k| &buf[k * 32..k * 32 + 32])
+        .filter(|e| e[0] & 0x7f == 12 && u32::from_le_bytes([e[4], e[5], e[6], e[7]]) == W)
+        .map(|e| {
+            (
+                u16::from_le_bytes([e[8], e[9]]),
+                u16::from_le_bytes([e[10], e[11]]),
+                u16::from_le_bytes([e[12], e[13]]),
+                u16::from_le_bytes([e[14], e[15]]),
+            )
+        })
+        .collect();
     assert_eq!(
-        exposes, 0,
-        "precondition: a shrink emits no Expose, so the pixels below are \
-         all the client will ever have",
+        exposes,
+        vec![(0, 0, 100, 100)],
+        "a shrink must report the whole new window exposed, exactly once — \
+         the client cannot recover a discarded window otherwise (#143)",
     );
 
     let (sw, sh, px) = f.backing(W);
@@ -14721,9 +14739,10 @@ fn a_shrink_keeps_the_content_it_never_exposes() {
     assert_eq!(
         distinct.keys().copied().collect::<Vec<_>>(),
         vec![[0x00, 0xFF, 0x00, 0xFF]],
-        "every retained pixel must still be the client's green (BGRA); a \
-         background-filled window here is content the client is never \
-         asked to redraw: {distinct:?}",
+        "every retained pixel must still be the client's green (BGRA); X11 \
+         leaves a background-None window's contents alone across a resize, \
+         so a background fill here would be a wipe Xorg never does: \
+         {distinct:?}",
     );
 }
 

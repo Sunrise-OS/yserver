@@ -21728,10 +21728,41 @@ fn handle_configure_window(
                 request.value_mask,
             );
         }
-        let grew = old_size.is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
-        if grew {
+        // A resize exposes the window in EITHER direction. Xorg draws no
+        // grow/shrink distinction: `miResizeWindow` copies the whole NEW
+        // clip list into the exposed region — "the entire window is
+        // trashed unless bitGravity recovers portions of it",
+        // `RegionCopy(&pWin->valdata->after.exposed, &pWin->clipList)`
+        // (`mi/miwindow.c:466-472`) — and only the bits a non-Forget
+        // `bitGravity` actually moved are subtracted from it afterwards
+        // (`mi/miwindow.c:596-599`). Under the default ForgetGravity
+        // `oldWinClip` stays NULL (`mi/miwindow.c:403-406`), nothing is
+        // subtracted, and the full window is reported for a shrink just
+        // as for a grow. The background state does not gate the event
+        // either: `miWindowExposures` paints first and sends second, and
+        // the `case None: return;` early-out lives in the PAINT
+        // (`mi/miexpose.c:387-389` and `:438-440`), so a background-None
+        // window keeps its pixels AND still receives the Expose.
+        //
+        // We used to emit this for a grow only, and that is #143's
+        // "already open windows get broken rendering": awesome retiles an
+        // xterm smaller, `configure_subwindow` re-tiles the leaf from the
+        // window's background (black on a dark terminal), and with no
+        // Expose nothing ever asks xterm to repaint. The prompt line came
+        // back because xterm redraws it anyway; the static rows of the
+        // shell banner stayed black for good.
+        //
+        // The region is the whole window for every gravity, not only
+        // ForgetGravity. Xorg would report just the newly-added strip
+        // under e.g. NorthWestGravity, because it really moved the old
+        // bits; this server has no bit-gravity path at all (the attribute
+        // reaches the render backend by no route — see `LeafContent` and
+        // `configure_subwindow`), so the pixels are gone whatever the
+        // attribute says and a narrower Expose would leave the window
+        // black. That narrowing is a separate, tracked divergence.
+        if resized {
             // Per X11 spec, Expose fires only for visible regions. A
-            // grow-configure on an unmapped (or Unviewable) window has no
+            // resize-configure on an unmapped (or Unviewable) window has no
             // visible region, so suppress the Expose until the window
             // becomes Viewable (MapWindow's own viewable-gated Expose path
             // covers that case). Without this gate, marco-style
@@ -31587,6 +31618,187 @@ mod tests {
             count_configure_notifies(&out),
             1,
             "a real restack must emit exactly one ConfigureNotify"
+        );
+    }
+
+    // ── #143 — a resize must report the window exposed, either way ──
+    //
+    // Xorg's `miResizeWindow` copies the NEW clip list wholesale into
+    // `after.exposed` — "the entire window is trashed unless bitGravity
+    // recovers portions of it" (`mi/miwindow.c:466-472`) — and only a
+    // non-Forget `bitGravity` subtracts the bits it actually moved
+    // (`:596-599`). There is no grow/shrink branch: under the default
+    // ForgetGravity the full window is reported in both directions.
+    // Nor does the background gate the EVENT — `miWindowExposures`
+    // paints, then sends (`mi/miexpose.c:387-389`), and the
+    // background-None early-out is inside the paint (`:438-440`).
+    //
+    // We emitted this for a grow only. On HW that is the #143 xterm:
+    // awesome retiles it smaller, the leaf is re-tiled from the
+    // window's black background, and with no Expose nothing asks xterm
+    // to repaint its static banner rows — they stay black while the
+    // prompt line, which xterm redraws unprompted, comes back.
+
+    /// One viewable, Expose-selecting child of root at `w`x`h`, plus
+    /// client 1's already-drained peer socket. `background_pixel` picks
+    /// the two shapes that matter here: `Some` is the xterm case (the
+    /// resize re-tiles the leaf and destroys the content), `None` is the
+    /// background-None case (the content survives).
+    fn one_viewable_expose_child(
+        w: u16,
+        h: u16,
+        background_pixel: Option<u32>,
+    ) -> (ServerState, UnixStream) {
+        const XID: u32 = 0x400;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(XID),
+                parent: ROOT_WINDOW,
+                width: w,
+                height: h,
+                background_pixel,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state
+                .resources
+                .window(ResourceId(XID))
+                .map(|win| win.background_none),
+            Some(background_pixel.is_none()),
+            "harness sanity: the background shape under test",
+        );
+        state
+            .resources
+            .window_mut(ResourceId(XID))
+            .expect("child installed")
+            .map_state = crate::resources::MapState::Viewable;
+        state
+            .clients
+            .get_mut(&1)
+            .expect("test client")
+            .event_masks
+            .insert(ResourceId(XID), 0x0000_8000); // ExposureMask
+        let _ = read_all_available(&mut peer);
+        (state, peer)
+    }
+
+    /// Every Expose in `bytes` for `window`, as `(x, y, width, height)`.
+    fn expose_rects(bytes: &[u8], window: u32) -> Vec<(u16, u16, u16, u16)> {
+        bytes
+            .chunks(32)
+            .filter(|e| {
+                e.len() == 32
+                    && e[0] & 0x7f == 12
+                    && u32::from_le_bytes([e[4], e[5], e[6], e[7]]) == window
+            })
+            .map(|e| {
+                (
+                    u16::from_le_bytes([e[8], e[9]]),
+                    u16::from_le_bytes([e[10], e[11]]),
+                    u16::from_le_bytes([e[12], e[13]]),
+                    u16::from_le_bytes([e[14], e[15]]),
+                )
+            })
+            .collect()
+    }
+
+    /// Resize `window` to `w`x`h` (CWWidth|CWHeight) and return whatever
+    /// reached the client.
+    fn resize_and_read(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        window: u32,
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let body = cw_restack_body(window, 0x000C, &[w, h]);
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn configure_window_shrink_exposes_the_whole_window() {
+        // The #143 case. `configure_subwindow` re-tiles the leaf from
+        // the window's background on a shrink, so without this Expose
+        // the discarded pixels are unrecoverable.
+        let (mut state, mut peer) = one_viewable_expose_child(200, 100, Some(0x0000_0000));
+        let out = resize_and_read(&mut state, &mut peer, 0x400, 100, 60);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            vec![(0, 0, 100, 60)],
+            "a shrink must report the whole NEW window exposed, exactly once \
+             (`mi/miwindow.c:466-472`); emitting none leaves an idle client \
+             showing the background fill forever (#143)",
+        );
+    }
+
+    #[test]
+    fn configure_window_grow_exposes_the_whole_window() {
+        // Over-suppression guard: the grow path predates the shrink one
+        // and must keep its single full-window Expose.
+        let (mut state, mut peer) = one_viewable_expose_child(100, 60, Some(0x0000_0000));
+        let out = resize_and_read(&mut state, &mut peer, 0x400, 200, 100);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            vec![(0, 0, 200, 100)],
+            "a grow must still report exactly one full-window Expose",
+        );
+    }
+
+    #[test]
+    fn configure_window_shrink_exposes_a_background_none_window_too() {
+        // A background-None window keeps its pixels across the resize
+        // (`mi/miexpose.c:438-440` returns before painting) but STILL
+        // gets the Expose: `miWindowExposures` calls `PaintWindow` and
+        // `miSendExposures` in sequence and only the paint is skipped
+        // (`mi/miexpose.c:387-389`). Nothing on this path may start
+        // reading the background state to suppress the event.
+        let (mut state, mut peer) = one_viewable_expose_child(200, 100, None);
+        let out = resize_and_read(&mut state, &mut peer, 0x400, 100, 60);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            vec![(0, 0, 100, 60)],
+            "a background-None window is not painted but is still told what \
+             was exposed",
+        );
+    }
+
+    #[test]
+    fn configure_window_pure_move_emits_no_expose() {
+        // Under-suppression guard: `after.exposed` is seeded from the
+        // clip list only when the size changes; a pure move of an
+        // unobscured window exposes nothing of the window itself.
+        let (mut state, mut peer) = one_viewable_expose_child(200, 100, Some(0x0000_0000));
+        let body = cw_restack_body(0x400, 0x0003, &[37, 41]); // CWX|CWY
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+        let out = read_all_available(&mut peer);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            Vec::new(),
+            "a move is not a resize and must not expose the window",
         );
     }
 

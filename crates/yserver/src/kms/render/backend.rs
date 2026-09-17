@@ -19968,10 +19968,12 @@ impl Backend for KmsBackend {
             // windows get broken rendering" when a compositor started
             // (#143): the window was wiped long before the redirect, and
             // the backing seed (`overlay_backing_inferiors`) then
-            // faithfully copied the blank leaf. A SHRINK cannot recover
-            // — we emit no Expose for one at all (measured:
-            // `a_shrink_keeps_the_content_it_never_exposes`), so nothing
-            // ever asks the client to repaint.
+            // faithfully copied the blank leaf. A shrink used to be
+            // unrecoverable on top of that, because we emitted no Expose
+            // for one; `handle_configure_window` now reports the whole
+            // window exposed in either direction, as Xorg does
+            // (`mi/miwindow.c:466-472`), so a discarded window WITH a
+            // background gets asked to repaint.
             //
             // A window WITH a background is still discarded and re-tiled:
             // that IS the ForgetGravity rule, and it is what the
