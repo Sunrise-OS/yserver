@@ -571,6 +571,11 @@ pub struct TransferResources {
     /// BO (its prior fence has signaled — no wait) to derive
     /// `gpu_render_ns`. `null` if the device has no timestamp support.
     pub timestamp_pool: vk::QueryPool,
+    /// Whether a submitted compose has reset and written both queries.
+    /// Reading a query that was never reset is invalid (validation:
+    /// "query not reset"), so the first compose of a new pool must skip
+    /// the read rather than rely on `NOT_READY`.
+    pub timestamps_written: bool,
 }
 
 // Intentionally `!Send + !Sync`: the mapped staging pointer and every
@@ -3500,6 +3505,7 @@ impl Drop for ScanoutBo {
                     staging_mapped: std::ptr::NonNull::dangling(),
                     staging_size: 0,
                     timestamp_pool: vk::QueryPool::null(),
+                    timestamps_written: false,
                 },
             );
             if t.command_pool != vk::CommandPool::null() {
@@ -6517,6 +6523,7 @@ fn allocate_transfer_resources(
         staging_mapped,
         staging_size,
         timestamp_pool,
+        timestamps_written: false,
     })
 }
 
