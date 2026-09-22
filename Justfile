@@ -1050,55 +1050,10 @@ yserver-awesome-hw-audit log="info" interval="30" idle="5":
 # `grep "loop telemetry" yserver-hw-awesome.log` for the per-second rollups.
 # RUST_LOG defaults to `info` so the rollup lines come through; pass
 # `log=warn` for quieter output (but you lose the rollups — they're info!).
-# Long-run resource telemetry: VRAM, per-GPU engine load and live
-# pixmap-pool occupancy, and NOTHING else. Built to be left running
-# for hours or a day — this is the recipe to hand a contributor
-# reproducing GH discussion 56 (yserver holding 3.5-4 GiB VRAM
-# against Xorg's 800-900 MiB on the same desktop).
-#
-# awesome because that is what the reporter runs, and because it
-# never composites.
-#
-# Why not `yserver-awesome-hw-telemetry log=info`: MEASURED on
-# silence 2026-09-22, that shape writes **2.12 MB/s** (434 MB in
-# 195 s) => ~179 GB/day, plus ~37 GB/day of submit-trace TSV. This
-# one filters to the `yserver::resources` target and writes no
-# submit trace: ~3 lines/s, ~39 MB/day.
-#
-# Handing this to a contributor: they run it, use the desktop
-# normally, then at the end close every client, let it idle a few
-# seconds, and exit. Then they just SEND THE FILE — reading it is
-# our job, not theirs, and a misread number is worse than no number.
-# A full day gzips to ~2.4 MB (20x; measured), so it attaches to an
-# issue or discussion directly:
-#
-#   gzip -k yserver-hw-awesome-resources.log
-#
-# `*.log` is gitignored — keep received captures out of the repo,
-# quote numbers in findings instead.
-#
-# Everything below is for reading it HERE.
-#
-# Reading it — the FLOOR is the number that matters. Close every
-# client, let it idle a few seconds, then compare that plateau
-# against the first lines, which are the no-client baseline.
-#
-# ⚠ The LAST sample is NOT the floor. Shutdown runs disable_output,
-# which calls PixmapPool::drain, so the final line is post-teardown:
-# MEASURED 2026-09-22 it read 276.1 MiB with `entries=0` while the
-# settled floor a second earlier was 318.6 MiB with 381 entries.
-# Reading the tail blindly understates the floor. Take the last
-# sample that still has a populated pool:
-#
-#   head -4 yserver-hw-awesome-resources.log            # baseline
-#   grep -v 'entries=0' <log> | tail -4                 # settled floor
-#
-# That drain also calibrates the pool line: 35.3 MiB of
-# `nominal_bytes_floor` released 42.5 MiB of real VRAM, so nominal
-# runs ~1.2x under the true cost rather than being wildly off.
-#
-# One line per physical GPU, so on a dual-GPU box each card is
-# reported separately rather than blended.
+# Long-run resource telemetry (vram / gpu load / pixmap pool live) only, for
+# leaving a session up for a day; plain `log=info` recipes grow by GB/hour.
+# Contributors send the log (`gzip -k`), they don't read it. The last sample
+# is post-teardown (pool drained): read the floor from `grep -v 'entries=0'`.
 yserver-awesome-hw-resources:
     cargo build --release --bin yserver
     bash -c '\
@@ -1117,6 +1072,63 @@ yserver-awesome-hw-resources:
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
+
+# Validation-layer session on yserver only (clients don't inherit it):
+# awesome + picom --backend glx + glxgears, stops itself after `seconds`.
+yserver-awesome-hw-validation bin="target/release/yserver" label="current" seconds="60":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    missing=""
+    for c in awesome picom glxgears; do command -v "$c" >/dev/null || missing="$missing $c"; done
+    [ -f /usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json ] || missing="$missing vulkan-validation-layers"
+    if [ -n "$missing" ]; then echo "missing:$missing"; exit 1; fi
+    if [ "{{bin}}" = "target/release/yserver" ]; then cargo build --release --bin yserver || exit 1; fi
+    log="$PWD/yserver-validation-{{label}}.vk.log"
+    rm -f "$log"
+    xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd"
+    VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+    VK_KHRONOS_VALIDATION_DEBUG_ACTION=VK_DBG_LAYER_ACTION_LOG_MSG \
+    VK_KHRONOS_VALIDATION_LOG_FILENAME="$log" \
+    VK_KHRONOS_VALIDATION_REPORT_FLAGS=error,warn \
+    VK_KHRONOS_VALIDATION_DUPLICATE_MESSAGE_LIMIT=0 \
+    RUST_LOG=warn RUST_BACKTRACE=1 "{{bin}}" > yserver-hw-validation-{{label}}.log 2>&1 &
+    ys=$!
+    sleep 2
+    unset WAYLAND_DISPLAY WAYLAND_SOCKET
+    export DISPLAY=:7 GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd"
+    awesome > awesome.log 2>&1 & aw=$!
+    sleep 2
+    picom --backend glx > picom.log 2>&1 & pc=$!
+    sleep 1
+    glxgears > /dev/null 2>&1 & gg=$!
+    sleep {{seconds}}
+    kill -TERM $gg $pc $aw 2>/dev/null; wait $gg $pc $aw 2>/dev/null
+    kill -TERM $ys 2>/dev/null; wait $ys 2>/dev/null
+    rm -rf "$xdg_rd"
+    echo "== {{label}}: $log"
+    if [ -f "$log" ]; then grep -oE '\[ [A-Za-z0-9_-]+ \]' "$log" | sort | uniq -c | sort -rn; else echo "   (no validation messages)"; fi
+
+# A/B of the above: `before` built in a worktree under target/, then the checkout.
+yserver-awesome-hw-validation-ab before="38099d85" seconds="60":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    wt=target/validation-before
+    [ -d "$wt" ] || git worktree add --detach "$wt" {{before}} || exit 1
+    git -C "$wt" checkout -q --detach {{before}} || exit 1
+    (cd "$wt" && cargo build --release --bin yserver) || exit 1
+    just yserver-awesome-hw-validation "$wt/target/release/yserver" before {{seconds}}
+    just yserver-awesome-hw-validation target/release/yserver after {{seconds}}
+    n() { [ -f "$2" ] || { echo 0; return; }; grep -c "$1" "$2"; true; }
+    echo
+    for l in before after; do
+        f=yserver-validation-$l.vk.log
+        printf '%-7s semaphore-in-use=%s  query-not-reset=%s\n' "$l" \
+            "$(n 'currently in use by VkQueue' "$f")" "$(n 'query not reset' "$f")"
+    done
+    if [ "$(n 'currently in use by VkQueue' yserver-validation-before.vk.log)" = 0 ] \
+        && [ "$(n 'query not reset' yserver-validation-before.vk.log)" = 0 ]; then
+        echo "WARNING: 'before' shows neither error -- this box does not reach those paths; inconclusive."
+    fi
 
 yserver-awesome-hw-telemetry log="info":
     cargo build --release --bin yserver
