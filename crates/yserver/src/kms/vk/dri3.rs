@@ -244,7 +244,7 @@ pub fn export_capable_modifiers(vk: &VkContext, format: vk::Format) -> Vec<u64> 
 /// `EXPORTABLE` external-memory feature and uses
 /// [`super::target::EXPORT_IMAGE_USAGE`] (which must match the usage the
 /// allocation actually requests).
-fn can_export_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> bool {
+pub(crate) fn can_export_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> bool {
     let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
         .drm_format_modifier(modifier)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
