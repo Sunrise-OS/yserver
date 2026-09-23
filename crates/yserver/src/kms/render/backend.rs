@@ -1908,6 +1908,28 @@ impl KmsBackend {
         }
     }
 
+    /// Whether every frame direct scanout holds (on screen, submitted, or
+    /// queued) is the composite overlay window or a descendant of it.
+    /// `false` when there are none, or when any is an ordinary window.
+    fn direct_frames_are_under_cow(&self) -> bool {
+        let frames = [
+            self.scanout_m2.current.as_ref(),
+            self.scanout_m2.pending.as_ref(),
+            self.scanout_m2.queued_successor.as_ref(),
+        ];
+        let mut any = false;
+        for frame in frames.into_iter().flatten() {
+            any = true;
+            if !matches!(
+                self.scanout_m0_target(frame.candidate.paint_dst_host_xid, None, None),
+                ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+            ) {
+                return false;
+            }
+        }
+        any
+    }
+
     fn request_direct_unflip(&mut self, reason: &'static str) {
         if !self.scanout_m2.active() {
             return;
@@ -18387,12 +18409,18 @@ impl Backend for KmsBackend {
             }
             order.push(host);
         }
-        if self.core.top_level_order != order {
+        if self.core.top_level_order != order && !self.direct_frames_are_under_cow() {
             // A direct frame bypasses the composed root scene. A real
             // top-level restack changes that scene even when the direct
             // Present target itself is untouched, so retire it through the
             // normal composed replacement path before accepting another
             // direct Present.
+            //
+            // Not when every direct frame is the compositor's overlay window
+            // or a descendant of it: the COW stacks above every top-level, so
+            // a restack beneath it cannot change the screen. A compositing
+            // desktop restacks constantly (raises, tooltips, notifications),
+            // and each needless unflip showed a stale frame on Cinnamon.
             self.request_direct_unflip("top_level_stack_changed");
         }
         self.core.top_level_order = order;
@@ -40308,6 +40336,72 @@ mod tests {
 
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
+    }
+
+    /// A compositor's frame (the COW, or a window inside it — Muffin's output
+    /// window) stacks above every top-level, so a restack beneath it cannot
+    /// change the screen and must NOT unflip. Cinnamon restacks on every
+    /// raise, tooltip and notification, and each needless unflip showed a
+    /// stale frame. The ordinary-window case above still unflips.
+    fn restack_under_direct_target_is_ignored(direct_target_under_cow: fn(&mut KmsBackend) -> u32) {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let below = ResourceId(0x0010_0b10);
+        let above = ResourceId(0x0010_0b20);
+        seed_state_window(&mut state, &mut b, below, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, above, ROOT_WINDOW, 0, 0, 100, 100);
+        let _ = state.resources.map_window(below);
+        let _ = state.resources.map_window(above);
+        b.sync_top_level_order(&state);
+
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let target = direct_target_under_cow(&mut b);
+        let _ = install_direct_frame_for_target_test(&mut b, target, cow_id, true);
+
+        state.resources.configure_window(ConfigureWindowRequest {
+            window: below,
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(0), // Above, no sibling -> raise to top.
+        });
+        b.sync_top_level_order(&state);
+
+        assert!(
+            !b.scanout_m2.unflip_requested,
+            "a restack under the COW must not leave direct scanout"
+        );
+        assert!(b.scanout_m2.hold_direct);
+    }
+
+    #[test]
+    fn sync_top_level_order_restack_under_direct_cow_keeps_direct_scanout() {
+        restack_under_direct_target_is_ignored(|_| {
+            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0
+        });
+    }
+
+    #[test]
+    fn sync_top_level_order_restack_under_direct_cow_descendant_keeps_direct_scanout() {
+        restack_under_direct_target_is_ignored(|b| {
+            let child = 0x00F0_0D00;
+            let _ = seed_window(
+                b,
+                child,
+                Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
+                0,
+                0,
+            );
+            child
+        });
     }
 
     /// A direct Present bypasses the scene compositor, so a fullscreen
