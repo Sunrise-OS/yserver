@@ -3067,9 +3067,10 @@ fn audit_overlay_pipeline(
     if !needed {
         return Ok((vk::Pipeline::null(), vk::PipelineLayout::null()));
     }
-    let pipeline = inner
-        .overlay_xor_cache
-        .get(yserver_core::backend::GcFunction::Xor, true)?;
+    let pipeline = inner.overlay_xor_cache.get(
+        yserver_core::backend::GcFunction::Xor,
+        crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
+    )?;
     Ok((pipeline, inner.overlay_xor_cache.pipeline_layout()))
 }
 
@@ -4588,9 +4589,10 @@ fn tick_one_output(
     let (xor_pipeline, xor_layout) = if overlay_ops.is_empty() {
         (vk::Pipeline::null(), vk::PipelineLayout::null())
     } else {
-        let pl = inner
-            .overlay_xor_cache
-            .get(yserver_core::backend::GcFunction::Xor, true)?;
+        let pl = inner.overlay_xor_cache.get(
+            yserver_core::backend::GcFunction::Xor,
+            crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
+        )?;
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
     let mut gpu_submitted = false;

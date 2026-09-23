@@ -6306,6 +6306,52 @@ impl KmsBackend {
         }
     }
 
+    /// Stamp alpha = 0xFF over `rects` (storage coordinates) when `target`
+    /// is a depth-24 drawable resolved into a depth-32 ancestor's redirect
+    /// backing; a no-op for every other target.
+    ///
+    /// A depth-24 window has no alpha, so its pixels must read opaque in
+    /// that backing — Xorg composites a mismatched-depth child into its
+    /// parent with alpha forced to 1. The fills and RENDER paths already
+    /// honour that; a raw image copy does not, and carries the source's
+    /// undefined X byte across (a GL client's background is commonly 0,
+    /// which picom then shows through). Called after each raw copy with
+    /// the rects it wrote.
+    fn stamp_opaque_alpha_if_shared(&mut self, target: PaintTarget, rects: &[ash::vk::Rect2D]) {
+        if rects.is_empty() || target.x11_depth() != 24 {
+            return;
+        }
+        if !self
+            .store
+            .get(target.backing_id())
+            .is_some_and(|d| d.depth == 32)
+        {
+            return;
+        }
+        let rects16: Vec<Rectangle16> = rects
+            .iter()
+            .filter_map(|r| {
+                Some(Rectangle16 {
+                    x: i16::try_from(r.offset.x).ok()?,
+                    y: i16::try_from(r.offset.y).ok()?,
+                    width: u16::try_from(r.extent.width).ok()?,
+                    height: u16::try_from(r.extent.height).ok()?,
+                })
+            })
+            .collect();
+        if let Err(e) = self.engine.stamp_opaque_alpha(
+            &mut self.store,
+            &mut self.platform,
+            target.dst(),
+            &rects16,
+        ) {
+            log::warn!(
+                "render: stamping opaque alpha into depth-32 backing {:?} failed: {e:?}",
+                target.backing_id()
+            );
+        }
+    }
+
     /// Stage 4a — resolve a host xid into the actual paint target
     /// under COMPOSITE redirect routing. Walks up the
     /// `windows.parent` chain accumulating `(x, y)` offsets;
@@ -22653,10 +22699,10 @@ impl Backend for KmsBackend {
             // non-mask scissors = compute_copy_area_scissors). Out-of-scope
             // cases fall through to the run-based path unchanged.
             let route_fn = self.core.current_function;
-            let route_dst_depth = self
-                .store
-                .get(dst_target.backing_id())
-                .map_or(24, |d| d.depth);
+            // The drawable's own depth, not its storage's: a depth-24 child
+            // painting into a depth-32 ancestor backing still has 24 planes,
+            // and its CPU fallback must force its alpha like any depth-24 write.
+            let route_dst_depth = dst_target.x11_depth();
             let route_full_mask = depth_plane_mask(route_dst_depth);
             let route_plane_mask = self.core.current_plane_mask & route_full_mask;
             let route_snapshot = if copy_area_masked_blit_eligible(
@@ -22763,6 +22809,10 @@ impl Backend for KmsBackend {
                         &scissors,
                     )
                     .map_err(|e| io::Error::other(format!("masked_copy_area: {e:?}")))?;
+                // Every pixel of a depth-24 child's area is opaque in a
+                // depth-32 backing, so stamping the whole scissor (not only
+                // the mask's pixels) is exact, not an approximation.
+                self.stamp_opaque_alpha_if_shared(dst_target, &scissors);
                 self.scene.wake_for_damage();
                 // ONE masked draw replaces the run fan-out. Telemetry: Task 15.
                 return Ok(());
@@ -22784,10 +22834,8 @@ impl Backend for KmsBackend {
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
             }
-            let dst_depth = self
-                .store
-                .get(dst_target.backing_id())
-                .map_or(24, |d| d.depth);
+            // As `route_dst_depth` above: the drawable's depth, not its storage's.
+            let dst_depth = dst_target.x11_depth();
             let full_mask = depth_plane_mask(dst_depth);
             let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
@@ -22805,6 +22853,7 @@ impl Backend for KmsBackend {
             let routes_to_cow =
                 self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
             let mut any_gpu = false;
+            let mut copied: Vec<ash::vk::Rect2D> = Vec::new();
             for run in runs {
                 let sub_src = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
@@ -22850,6 +22899,10 @@ impl Backend for KmsBackend {
                         );
                     } else {
                         any_gpu = true;
+                        copied.push(ash::vk::Rect2D {
+                            offset: dst_pos,
+                            extent: sub_src.extent,
+                        });
                     }
                 } else {
                     self.telemetry.record_copy_area_cpu_pixmap_clip();
@@ -22864,6 +22917,7 @@ impl Backend for KmsBackend {
                     );
                 }
             }
+            self.stamp_opaque_alpha_if_shared(dst_target, &copied);
             if any_gpu && !routes_to_cow {
                 self.telemetry.record_paint_submit();
                 self.trace_simple(SubmitKind::CopyArea, dst_target.backing_id(), 1);
@@ -22936,6 +22990,7 @@ impl Backend for KmsBackend {
             self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
 
         let mut all_ok = true;
+        let mut copied: Vec<ash::vk::Rect2D> = Vec::with_capacity(sub_rects.len());
         for sub in &sub_rects {
             let sub_dst_x = sub.offset.x;
             let sub_dst_y = sub.offset.y;
@@ -22982,8 +23037,16 @@ impl Backend for KmsBackend {
                      dst=0x{dst_host_xid:x} sub_rect={sub:?} cow_routed={routes_to_cow}): {e:?}",
                 );
                 all_ok = false;
+            } else {
+                copied.push(ash::vk::Rect2D {
+                    offset: dst_pos,
+                    extent: sub.extent,
+                });
             }
         }
+        // The PresentPixmap path lands here: a raw image copy that carries
+        // the source's X byte into the backing verbatim.
+        self.stamp_opaque_alpha_if_shared(dst_target, &copied);
         if all_ok {
             if !routes_to_cow {
                 self.telemetry.record_paint_submit();
