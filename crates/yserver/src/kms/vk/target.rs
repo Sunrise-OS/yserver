@@ -1431,6 +1431,7 @@ pub fn allocate_exportable(
 /// Whether the driver advertises a `TILING_LINEAR` image with
 /// [`EXPORT_IMAGE_USAGE`] as an exportable dma-buf. The `TILING_LINEAR`
 /// counterpart of [`super::dri3::can_export_modifier`].
+#[track_caller]
 fn linear_tiling_exportable(vk: &VkContext, format: vk::Format) -> bool {
     let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -1442,13 +1443,13 @@ fn linear_tiling_exportable(vk: &VkContext, format: vk::Format) -> bool {
         .push_next(&mut external_info);
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    let result = unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    };
+    let result = super::image_format_properties2(
+        vk,
+        "target::linear_tiling_exportable",
+        None,
+        &format_info,
+        &mut props2,
+    );
     if result.is_err() {
         return false;
     }

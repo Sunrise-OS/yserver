@@ -5439,6 +5439,7 @@ fn scanout_modifier_single_plane_supports_feature(
     modifier_single_plane_supports_feature(vk, modifier, scanout_image_usage(), feature)
 }
 
+#[track_caller]
 fn modifier_single_plane_supports_feature(
     vk: &VkContext,
     modifier: u64,
@@ -5467,13 +5468,13 @@ fn modifier_single_plane_supports_feature(
 
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    }
+    if super::image_format_properties2(
+        vk,
+        "scanout::modifier_single_plane_supports_feature",
+        Some(modifier),
+        &format_info,
+        &mut props2,
+    )
     .is_err()
     {
         return false;
@@ -5640,6 +5641,7 @@ fn validate_copied_route_pair(
 /// the established allocator's candidate construction. Keeping the runtime
 /// predicate separate guarantees that adding diagnostics cannot prune or
 /// reorder any allocation plan.
+#[track_caller]
 fn probe_scanout_modifier_single_plane_feature(
     vk: &VkContext,
     modifier: u64,
@@ -5668,13 +5670,13 @@ fn probe_scanout_modifier_single_plane_feature(
 
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if let Err(error) = unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    } {
+    if let Err(error) = super::image_format_properties2(
+        vk,
+        "scanout::probe_scanout_modifier_single_plane_feature",
+        Some(modifier),
+        &format_info,
+        &mut props2,
+    ) {
         return if error == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
             Unsupported
         } else {
@@ -5702,6 +5704,7 @@ fn probe_scanout_modifier_single_plane_feature(
 /// `VK_IMAGE_TILING_LINEAR` scanout image. This is the renderer-owned
 /// ExplicitLinear/LegacyLinear evidence; padded explicit-linear remains part
 /// of the modifier observation above.
+#[track_caller]
 fn probe_scanout_linear_feature(
     vk: &VkContext,
     feature: vk::ExternalMemoryFeatureFlags,
@@ -5722,13 +5725,13 @@ fn probe_scanout_linear_feature(
         .push_next(&mut external_info);
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if let Err(error) = unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    } {
+    if let Err(error) = super::image_format_properties2(
+        vk,
+        "scanout::probe_scanout_linear_feature",
+        None,
+        &format_info,
+        &mut props2,
+    ) {
         return if error == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
             Unsupported
         } else {
