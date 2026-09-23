@@ -485,7 +485,7 @@ impl Storage {
                 vk.device.destroy_image(self.image, None);
             }
             if self.memory != vk::DeviceMemory::null() {
-                vk.device.free_memory(self.memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, self.memory);
             }
         }
     }

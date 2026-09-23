@@ -4551,6 +4551,22 @@ impl PlatformBackend {
         height: u16,
         depth: u8,
     ) -> Result<Storage, vk::Result> {
+        self.allocate_drawable_storage_as(
+            width,
+            height,
+            depth,
+            crate::kms::vk::mem_accounting::MemCategory::Pixmap,
+        )
+    }
+
+    /// [`Self::allocate_drawable_storage`], accounting the memory under `category`.
+    pub(crate) fn allocate_drawable_storage_as(
+        &self,
+        width: u16,
+        height: u16,
+        depth: u8,
+        category: crate::kms::vk::mem_accounting::MemCategory,
+    ) -> Result<Storage, vk::Result> {
         let vk = self
             .vk
             .as_ref()
@@ -4594,6 +4610,7 @@ impl PlatformBackend {
                         return Err(e);
                     }
                 };
+                crate::kms::vk::mem_accounting::recategorise(pooled.memory, category);
                 return Ok(Storage::from_pooled(
                     pooled,
                     sample_view,
@@ -4645,7 +4662,12 @@ impl PlatformBackend {
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mt);
-        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+            &vk.device,
+            &alloc_info,
+            category,
+            &mem_props,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { vk.device.destroy_image(image, None) };
@@ -4654,7 +4676,7 @@ impl PlatformBackend {
         };
         if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e);
@@ -4674,7 +4696,7 @@ impl PlatformBackend {
             Ok(v) => v,
             Err(e) => {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e);
@@ -4693,7 +4715,7 @@ impl PlatformBackend {
             Err(e) => {
                 unsafe {
                     vk.device.destroy_image_view(view, None);
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e);
