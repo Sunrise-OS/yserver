@@ -1050,6 +1050,74 @@ yserver-awesome-hw-audit log="info" interval="30" idle="5":
 # `grep "loop telemetry" yserver-hw-awesome.log` for the per-second rollups.
 # RUST_LOG defaults to `info` so the rollup lines come through; pass
 # `log=warn` for quieter output (but you lose the rollups — they're info!).
+# Long-run resource telemetry: VRAM, per-GPU engine load and live
+# pixmap-pool occupancy, and NOTHING else. Built to be left running
+# for hours or a day — this is the recipe to hand a contributor
+# reproducing GH discussion 56 (yserver holding 3.5-4 GiB VRAM
+# against Xorg's 800-900 MiB on the same desktop).
+#
+# awesome because that is what the reporter runs, and because it
+# never composites.
+#
+# Why not `yserver-awesome-hw-telemetry log=info`: MEASURED on
+# silence 2026-09-22, that shape writes **2.12 MB/s** (434 MB in
+# 195 s) => ~179 GB/day, plus ~37 GB/day of submit-trace TSV. This
+# one filters to the `yserver::resources` target and writes no
+# submit trace: ~3 lines/s, ~39 MB/day.
+#
+# Handing this to a contributor: they run it, use the desktop
+# normally, then at the end close every client, let it idle a few
+# seconds, and exit. Then they just SEND THE FILE — reading it is
+# our job, not theirs, and a misread number is worse than no number.
+# A full day gzips to ~2.4 MB (20x; measured), so it attaches to an
+# issue or discussion directly:
+#
+#   gzip -k yserver-hw-awesome-resources.log
+#
+# `*.log` is gitignored — keep received captures out of the repo,
+# quote numbers in findings instead.
+#
+# Everything below is for reading it HERE.
+#
+# Reading it — the FLOOR is the number that matters. Close every
+# client, let it idle a few seconds, then compare that plateau
+# against the first lines, which are the no-client baseline.
+#
+# ⚠ The LAST sample is NOT the floor. Shutdown runs disable_output,
+# which calls PixmapPool::drain, so the final line is post-teardown:
+# MEASURED 2026-09-22 it read 276.1 MiB with `entries=0` while the
+# settled floor a second earlier was 318.6 MiB with 381 entries.
+# Reading the tail blindly understates the floor. Take the last
+# sample that still has a populated pool:
+#
+#   head -4 yserver-hw-awesome-resources.log            # baseline
+#   grep -v 'entries=0' <log> | tail -4                 # settled floor
+#
+# That drain also calibrates the pool line: 35.3 MiB of
+# `nominal_bytes_floor` released 42.5 MiB of real VRAM, so nominal
+# runs ~1.2x under the true cost rather than being wildly off.
+#
+# One line per physical GPU, so on a dual-GPU box each card is
+# reported separately rather than blended.
+yserver-awesome-hw-resources:
+    cargo build --release --bin yserver
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 \
+            RUST_LOG="warn,yserver::resources=info" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-awesome-resources.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 awesome > awesome.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 yserver-awesome-hw-telemetry log="info":
     cargo build --release --bin yserver
     rm -f yserver-awesome.submit.tsv
