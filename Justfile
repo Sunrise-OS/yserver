@@ -311,6 +311,8 @@ yserver-reset-hw log="info":
         echo "";\
         echo "reset-hw: done. Please send $resetlog from this directory."'
 
+# Sources /etc/xprofile and ~/.xprofile like display managers do, so a startx
+# session gets the same environment (e.g. SSH_AUTH_SOCK) as a lightdm login.
 startx log="info":
     cargo build --release --bin yserver
     bash -c '\
@@ -328,7 +330,11 @@ startx log="info":
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         xinitrc=~/.xinitrc;\
         [ -f "$xinitrc" ] || xinitrc=/etc/X11/xinit/xinitrc;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 XAUTHORITY="$userauth" DISPLAY=":$display" sh "$xinitrc" > startx.log 2>&1;\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export XDG_SESSION_TYPE=x11 XAUTHORITY="$userauth" DISPLAY=":$display";\
+        if [ -f /etc/xprofile ]; then . /etc/xprofile; fi;\
+        if [ -f "$HOME/.xprofile" ]; then . "$HOME/.xprofile"; fi;\
+        sh "$xinitrc" > startx.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         xauth -f "$userauth" remove ":$display" 2>/dev/null;\
