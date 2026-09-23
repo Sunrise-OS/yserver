@@ -1416,12 +1416,19 @@ pub fn allocate_exportable(
         // covers any driver that advertises nothing exportable. vkCreateImage
         // accepts this image anyway and it works in practice, so it is used
         // deliberately — refusing would disable DRI3 export on these GPUs.
-        // It stays visible under validation.
+        // It stays visible under validation. When it fails too (lavapipe),
+        // the driver has said no both ways: report it as unsupported.
+        let img = allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE)
+            .map_err(|e| {
+                log::debug!(
+                    "allocate_exportable: unadvertised TILING_LINEAR export failed ({e:?})"
+                );
+                vk::Result::ERROR_FORMAT_NOT_SUPPORTED
+            })?;
         log::info!(
             "allocate_exportable: driver advertises no dma-buf export tiling for {format:?}; \
              using TILING_LINEAR outside advertised support"
         );
-        let img = allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE)?;
         (TilingStrategy::Linear, img)
     };
     let _ = vk.tfp_tiling_strategy.set(strategy);
