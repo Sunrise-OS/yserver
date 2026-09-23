@@ -312,7 +312,7 @@ yserver-reset-hw log="info":
         echo "reset-hw: done. Please send $resetlog from this directory."'
 
 startx log="info":
-    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
         display=0;\
@@ -323,7 +323,7 @@ startx log="info":
         xauth -f "$authfile" add ":$display" . "$cookie";\
         xauth -f "$userauth" add ":$display" . "$cookie";\
         echo "startx: using DISPLAY=:$display (server auth $authfile; cookie also added to $userauth)";\
-        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
         yserver_pid=$!;\
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         xinitrc=~/.xinitrc;\
