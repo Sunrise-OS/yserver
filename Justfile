@@ -1115,7 +1115,7 @@ yserver-awesome-hw-validation bin="target/release/yserver" label="current" secon
     if [ -f "$log" ]; then grep -oE '\[ [A-Za-z0-9_-]+ \]' "$log" | sort | uniq -c | sort -rn; else echo "   (no validation messages)"; fi
 
 # A/B of the above: `before` built in a worktree under target/, then the checkout.
-yserver-awesome-hw-validation-ab before="38099d85" seconds="60":
+yserver-awesome-hw-validation-ab before="16581ab3" seconds="60":
     #!/usr/bin/env bash
     set -uo pipefail
     wt=target/validation-before
